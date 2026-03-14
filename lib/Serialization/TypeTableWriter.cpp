@@ -1,0 +1,80 @@
+#include "metal-ir/ValueEnumerator.h"
+#include "llvm/Bitcode/LLVMBitCodes.h"
+#include "llvm/Bitstream/BitstreamWriter.h"
+#include "llvm/IR/DerivedTypes.h"
+
+using namespace llvm;
+
+namespace metalir {
+
+void emitTypeBlock(BitstreamWriter &W, ValueEnumerator &E) {
+  W.EnterSubblock(bitc::TYPE_BLOCK_ID_NEW, 4);
+
+  SmallVector<uint64_t, 8> V;
+  V.push_back(E.types.size());
+  W.EmitRecord(bitc::TYPE_CODE_NUMENTRY, V);
+
+  for (auto &entry : E.types) {
+    Type *T = entry.type;
+    V.clear();
+
+    if (T->isVoidTy()) {
+      W.EmitRecord(bitc::TYPE_CODE_VOID, V);
+    } else if (T->isFloatTy()) {
+      W.EmitRecord(bitc::TYPE_CODE_FLOAT, V);
+    } else if (T->isDoubleTy()) {
+      W.EmitRecord(bitc::TYPE_CODE_DOUBLE, V);
+    } else if (T->isHalfTy()) {
+      W.EmitRecord(bitc::TYPE_CODE_HALF, V);
+    } else if (T->isBFloatTy()) {
+      W.EmitRecord(bitc::TYPE_CODE_BFLOAT, V);
+    } else if (T->isIntegerTy()) {
+      V.push_back(cast<IntegerType>(T)->getBitWidth());
+      W.EmitRecord(bitc::TYPE_CODE_INTEGER, V);
+    } else if (T->isMetadataTy()) {
+      W.EmitRecord(bitc::TYPE_CODE_METADATA, V);
+    } else if (T->isLabelTy()) {
+      W.EmitRecord(bitc::TYPE_CODE_LABEL, V);
+    } else if (isa<PointerType>(T)) {
+      // entry.pointee is the typed pointer's pointee
+      V.push_back(E.typeIdx(entry.pointee));
+      V.push_back(cast<PointerType>(T)->getAddressSpace());
+      W.EmitRecord(bitc::TYPE_CODE_POINTER, V);
+    } else if (auto *VT = dyn_cast<FixedVectorType>(T)) {
+      V.push_back(VT->getNumElements());
+      V.push_back(E.typeIdx(VT->getElementType()));
+      W.EmitRecord(bitc::TYPE_CODE_VECTOR, V);
+    } else if (auto *AT = dyn_cast<ArrayType>(T)) {
+      V.push_back(AT->getNumElements());
+      V.push_back(E.typeIdx(AT->getElementType()));
+      W.EmitRecord(bitc::TYPE_CODE_ARRAY, V);
+    } else if (auto *FT = dyn_cast<FunctionType>(T)) {
+      V.push_back(FT->isVarArg() ? 1 : 0);
+      V.push_back(E.typeIdx(FT->getReturnType()));
+      // Use stored per-param indices for correct multi-pointee support
+      auto pit = E.funcTypeParamIndices.find(FT);
+      if (pit != E.funcTypeParamIndices.end()) {
+        for (unsigned idx : pit->second) V.push_back(idx);
+      } else {
+        for (auto *PT : FT->params()) V.push_back(E.typeIdx(PT));
+      }
+      W.EmitRecord(bitc::TYPE_CODE_FUNCTION, V);
+    } else if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->hasName()) {
+        SmallVector<uint64_t, 32> NV;
+        for (char C : ST->getName()) NV.push_back((uint64_t)(unsigned char)C);
+        W.EmitRecord(bitc::TYPE_CODE_STRUCT_NAME, NV);
+        V.push_back(ST->isPacked() ? 1 : 0);
+        for (auto *ET : ST->elements()) V.push_back(E.typeIdx(ET));
+        W.EmitRecord(bitc::TYPE_CODE_STRUCT_NAMED, V);
+      } else {
+        V.push_back(ST->isPacked() ? 1 : 0);
+        for (auto *ET : ST->elements()) V.push_back(E.typeIdx(ET));
+        W.EmitRecord(bitc::TYPE_CODE_STRUCT_ANON, V);
+      }
+    }
+  }
+  W.ExitBlock();
+}
+
+} // namespace metalir
