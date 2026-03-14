@@ -91,7 +91,13 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         W.EmitRecord(bitc::FUNC_CODE_INST_BINOP, V);
       } else if (auto *CI = dyn_cast<CastInst>(&I)) {
         V.push_back(getID(CI->getOperand(0)));
-        V.push_back(E.typeIdx(CI->getDestTy()));
+        // For casts producing pointers, use PTM-inferred pointee
+        // (Metal v1 needs correct typed pointer per value usage)
+        if (CI->getType()->isPointerTy()) {
+          V.push_back(E.ptrTypeIdxForValue(CI));
+        } else {
+          V.push_back(E.typeIdx(CI->getDestTy()));
+        }
         V.push_back(encodeCast(CI->getOpcode()));
         W.EmitRecord(bitc::FUNC_CODE_INST_CAST, V);
       } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -125,6 +131,11 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         V.push_back(getID(SV->getOperand(1)));
         V.push_back(getID(SV->getShuffleMaskForBitcode()));
         W.EmitRecord(bitc::FUNC_CODE_INST_SHUFFLEVEC, V);
+      } else if (auto *IV = dyn_cast<InsertValueInst>(&I)) {
+        V.push_back(getID(IV->getAggregateOperand()));
+        V.push_back(getID(IV->getInsertedValueOperand()));
+        for (unsigned idx : IV->getIndices()) V.push_back(idx);
+        W.EmitRecord(bitc::FUNC_CODE_INST_INSERTVAL, V);
       } else if (auto *EV = dyn_cast<ExtractValueInst>(&I)) {
         V.push_back(getID(EV->getAggregateOperand()));
         for (unsigned idx : EV->getIndices()) V.push_back(idx);

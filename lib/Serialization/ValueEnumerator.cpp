@@ -64,7 +64,11 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
   // correct typed pointer entries for each parameter.
   for (auto &F : M)
     addFunctionType(F.getFunctionType(), &F);
-  addType(ptrAs0);
+  // Create function pointer types for definitions (kernels) only.
+  // Declarations (intrinsics) don't need function pointers in Metal v1.
+  for (auto &F : M)
+    if (!F.isDeclaration())
+      ptrTypeIdx(ptrAs0, F.getFunctionType());
 
   addType(Type::getMetadataTy(Ctx));
   addType(Type::getLabelTy(Ctx));
@@ -87,15 +91,29 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
           if (!isa<BasicBlock>(Op))
             addType(Op->getType());
         // GEP result: create ptr(elementType, addrspace) entry
-        // Use PTM override if available (e.g., store float through i8* GEP
-        // should produce float*, not i8*)
+        // Use PTM override for device (AS 1) pointers (e.g., store float
+        // through i8* GEP should produce float*, not i8*).
+        // For TG (AS 3) byte globals, keep GEP's own result element type —
+        // the byte global stays as [N x i8] and GEP results must be i8*.
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
           if (GEP->getType()->isPointerTy()) {
             Type *resultPointee = GEP->getResultElementType();
-            if (auto *ptmTy = PTM.get(GEP))
-              resultPointee = ptmTy;
             unsigned AS = GEP->getType()->getPointerAddressSpace();
+            if (AS != 3 || !resultPointee->isIntegerTy(8)) {
+              if (auto *ptmTy = PTM.get(GEP))
+                resultPointee = ptmTy;
+            }
             ptrTypeIdx(PointerType::get(M.getContext(), AS), resultPointee);
+          }
+        }
+        // Bitcast ptr→ptr: in Metal v1 these change typed pointer.
+        // Create a separate typed pointer entry from PTM.
+        if (auto *BC = dyn_cast<BitCastInst>(&I)) {
+          if (BC->getType()->isPointerTy() && BC->getSrcTy() == BC->getDestTy()) {
+            if (auto *ptmTy = PTM.get(BC)) {
+              unsigned AS = BC->getType()->getPointerAddressSpace();
+              ptrTypeIdx(PointerType::get(M.getContext(), AS), ptmTy);
+            }
           }
         }
       }
@@ -108,7 +126,14 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
     globalValueMap[&GV] = globalValues.size();
     globalValues.push_back(&GV);
   }
+  // Definitions first, then declarations (matches MetalASM ordering)
   for (auto &F : M) {
+    if (F.isDeclaration()) continue;
+    globalValueMap[&F] = globalValues.size();
+    globalValues.push_back(&F);
+  }
+  for (auto &F : M) {
+    if (!F.isDeclaration()) continue;
     globalValueMap[&F] = globalValues.size();
     globalValues.push_back(&F);
   }
@@ -135,6 +160,15 @@ unsigned ValueEnumerator::typeIdx(Type *T) {
   auto it = typeMap.find(E);
   if (it != typeMap.end()) return it->second;
   return addType(T);
+}
+
+unsigned ValueEnumerator::ptrTypeIdxForValue(const Value *V) {
+  Type *pointee = nullptr;
+  if (auto *ty = PTM.get(const_cast<Value*>(V)))
+    pointee = ty;
+  if (!pointee)
+    pointee = pointeeType(V->getType());
+  return ptrTypeIdx(V->getType(), pointee);
 }
 
 unsigned ValueEnumerator::ptrTypeIdx(Type *PtrTy, Type *pointee) {

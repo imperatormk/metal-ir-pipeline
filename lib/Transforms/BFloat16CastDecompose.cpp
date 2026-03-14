@@ -25,6 +25,7 @@ PreservedAnalyses BFloat16CastDecomposePass::run(Module &M,
   Type *BF16 = Type::getBFloatTy(M.getContext());
   Type *F32 = Type::getFloatTy(M.getContext());
 
+  // Phase 1: Decompose sitofp/uitofp iN→bfloat via float intermediate
   for (auto &F : M) {
     for (auto &BB : F) {
       for (auto it = BB.begin(); it != BB.end();) {
@@ -39,6 +40,39 @@ PreservedAnalyses BFloat16CastDecomposePass::run(Module &M,
           I->eraseFromParent();
           changed = true;
         }
+      }
+    }
+  }
+
+  // Phase 2: Lower sitofp/uitofp i8/i16→float to air.convert intrinsics.
+  // Metal's bitcode doesn't support LLVM sitofp for sub-32-bit integer types.
+  for (auto &F : M) {
+    for (auto &BB : F) {
+      for (auto it = BB.begin(); it != BB.end();) {
+        auto *I = &*it++;
+        bool isSigned = isa<SIToFPInst>(I);
+        if (!isSigned && !isa<UIToFPInst>(I)) continue;
+        if (I->getType() != F32) continue;
+
+        Type *srcTy = I->getOperand(0)->getType();
+        unsigned bits = srcTy->getIntegerBitWidth();
+        if (bits >= 32) continue; // i32→float is fine as sitofp
+
+        // Build intrinsic name: air.convert.f.f32.{s|u}.i{8|16}
+        std::string name = "air.convert.f.f32.";
+        name += isSigned ? "s" : "u";
+        name += ".i" + std::to_string(bits);
+
+        auto *ConvFn = M.getOrInsertFunction(
+            name, FunctionType::get(F32, {srcTy}, false)).getCallee();
+
+        IRBuilder<> B(I);
+        auto *Call = B.CreateCall(
+            cast<Function>(ConvFn)->getFunctionType(),
+            ConvFn, {I->getOperand(0)}, I->getName());
+        I->replaceAllUsesWith(Call);
+        I->eraseFromParent();
+        changed = true;
       }
     }
   }

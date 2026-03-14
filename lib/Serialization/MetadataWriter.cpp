@@ -78,7 +78,7 @@ void emitMetadataKindBlock(BitstreamWriter &W) {
     "unpredictable","invariant.group","align","llvm.loop","type",
     "section_prefix","absolute_symbol","associated","callees","irr_loop",
     "llvm.access.group","callback","llvm.preserve.access.index",
-    "vcall_visibility","noundef","annotation","nosanitize",
+    "vcall_visibility","noundef","annotation",
     "heapallocsite","air.function_groups",
   };
   for (unsigned i = 0; i < sizeof(kinds)/sizeof(kinds[0]); i++) {

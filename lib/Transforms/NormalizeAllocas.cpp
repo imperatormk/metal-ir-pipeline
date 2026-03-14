@@ -38,6 +38,17 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
   bool changed = false;
   Type *I32 = Type::getInt32Ty(M.getContext());
 
+  // Strip 'disjoint' flag from 'or' instructions.
+  // Metal v1 bitcode doesn't support this LLVM 19+ flag.
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *BO = dyn_cast<PossiblyDisjointInst>(&I))
+          if (BO->isDisjoint()) {
+            BO->setIsDisjoint(false);
+            changed = true;
+          }
+
   for (auto &F : M) {
     for (auto &BB : F) {
       for (auto it = BB.begin(); it != BB.end();) {
@@ -53,13 +64,10 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
           continue;
         }
 
-        // Remove no-op bitcasts (ptr → ptr same type)
+        // Keep all no-op bitcasts (ptr → ptr same type).
+        // In Metal v1 bitcode they change the typed pointer
+        // (e.g., i8* → <2 x float>*, or float* → bfloat*).
         if (auto *BC = dyn_cast<BitCastInst>(&I)) {
-          if (BC->getSrcTy() == BC->getDestTy()) {
-            BC->replaceAllUsesWith(BC->getOperand(0));
-            BC->eraseFromParent();
-            changed = true;
-          }
           continue;
         }
 

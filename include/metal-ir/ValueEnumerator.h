@@ -76,6 +76,9 @@ public:
   /// Get type index for a pointer type with specific pointee.
   unsigned ptrTypeIdx(llvm::Type *PtrTy, llvm::Type *pointee);
 
+  /// Get typed pointer index for a Value using PTM inference.
+  unsigned ptrTypeIdxForValue(const llvm::Value *V);
+
   /// Get type index for a global variable's pointer type (uses value type as pointee).
   unsigned globalPtrTypeIdx(const llvm::GlobalVariable *GV);
 

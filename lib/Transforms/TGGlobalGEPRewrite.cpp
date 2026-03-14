@@ -83,8 +83,175 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
   bool changed = false;
   auto &Ctx = M.getContext();
   auto &DL = M.getDataLayout();
+  Type *I32 = Type::getInt32Ty(Ctx);
 
   SmallVector<GlobalVariable *, 4> byteGlobals;
+  SmallVector<GlobalVariable *, 4> mmaGlobals;
+  for (auto &GV : M.globals()) {
+    if (GV.getAddressSpace() != 3) continue;
+    auto *AT = dyn_cast<ArrayType>(GV.getValueType());
+    if (!AT) continue;
+    if (AT->getElementType()->isIntegerTy(8))
+      byteGlobals.push_back(&GV);
+    else
+      mmaGlobals.push_back(&GV);
+  }
+
+  // ── Byte→MMA merge ─────────────────────────────────────────────
+  // When both [N x i8] scratch and [M x float] MMA globals exist,
+  // merge into one global. They alias the same memory (barrier-separated).
+  // Only when exactly 1 MMA global remains after coalesce.
+  // Before merging, scalarize <1 x T> on the byte global so
+  // inferTGElementType returns scalar float (enabling the merge).
+  // Check for wide vector stores on byte global
+  bool hasWideVec = false;
+  if (!byteGlobals.empty() && mmaGlobals.size() == 1) {
+    auto *byteGV = byteGlobals[0];
+    expandConstantExprUsers(byteGV);
+    {
+      std::function<void(Value *)> check = [&](Value *V) {
+        for (auto *U : V->users()) {
+          if (auto *SI = dyn_cast<StoreInst>(U))
+            if (SI->getPointerOperand() == V)
+              if (auto *VT = dyn_cast<FixedVectorType>(SI->getValueOperand()->getType()))
+                if (VT->getNumElements() > 1) hasWideVec = true;
+          if (isa<GetElementPtrInst>(U)) check(U);
+        }
+      };
+      check(byteGV);
+    }
+
+    // Scalarize <1 x T> for merge candidate only
+    SmallVector<Instruction *, 8> vec1Users;
+    std::function<void(Value *)> findVec1 = [&](Value *V) {
+      for (auto *U : V->users()) {
+        if (auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand() == V) {
+            auto *VT = dyn_cast<FixedVectorType>(SI->getValueOperand()->getType());
+            if (VT && VT->getNumElements() == 1) vec1Users.push_back(SI);
+          }
+        } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+          auto *VT = dyn_cast<FixedVectorType>(LI->getType());
+          if (VT && VT->getNumElements() == 1) vec1Users.push_back(LI);
+        } else if (isa<GetElementPtrInst>(U)) {
+          findVec1(U);
+        }
+      }
+    };
+    findVec1(byteGV);
+    for (auto *I : vec1Users) {
+      if (auto *SI = dyn_cast<StoreInst>(I)) {
+        IRBuilder<> B(SI);
+        Value *scalar = B.CreateExtractElement(SI->getValueOperand(),
+            ConstantInt::get(I32, 0));
+        B.CreateAlignedStore(scalar, SI->getPointerOperand(),
+            SI->getAlign(), SI->isVolatile());
+        SI->eraseFromParent();
+        changed = true;
+      } else if (auto *LI = dyn_cast<LoadInst>(I)) {
+        IRBuilder<> B(LI);
+        auto *VT = cast<FixedVectorType>(LI->getType());
+        auto *scalar = B.CreateAlignedLoad(VT->getElementType(),
+            LI->getPointerOperand(), LI->getAlign(), LI->isVolatile());
+        Value *vec = B.CreateInsertElement(
+            UndefValue::get(VT), scalar, ConstantInt::get(I32, 0));
+        LI->replaceAllUsesWith(vec);
+        LI->eraseFromParent();
+        changed = true;
+      }
+    }
+    // Fold extract(insert(undef, x, 0), 0) → x
+    for (auto &F : M) {
+      for (auto &BB : F) {
+        for (auto it = BB.begin(); it != BB.end();) {
+          Instruction &I = *it++;
+          if (auto *EE = dyn_cast<ExtractElementInst>(&I)) {
+            if (auto *IE = dyn_cast<InsertElementInst>(EE->getVectorOperand())) {
+              auto *VT = dyn_cast<FixedVectorType>(IE->getType());
+              if (VT && VT->getNumElements() == 1) {
+                EE->replaceAllUsesWith(IE->getOperand(1));
+                EE->eraseFromParent();
+                if (IE->use_empty()) IE->eraseFromParent();
+                changed = true;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!byteGlobals.empty() && mmaGlobals.size() == 1 && !hasWideVec) {
+    auto *byteGV = byteGlobals[0];
+    auto *mmaGV = mmaGlobals[0];
+    auto *byteAT = cast<ArrayType>(byteGV->getValueType());
+    auto *mmaAT = cast<ArrayType>(mmaGV->getValueType());
+
+    uint64_t byteBytes = byteAT->getNumElements();
+    unsigned mmaElemSize = DL.getTypeAllocSize(mmaAT->getElementType());
+    uint64_t mmaBytes = mmaAT->getNumElements() * mmaElemSize;
+    uint64_t floatCount = (std::max(byteBytes, mmaBytes) + 3) / 4;
+
+    auto *mergedAT = ArrayType::get(Type::getFloatTy(Ctx), floatCount);
+    expandConstantExprUsers(byteGV);
+
+    auto *mergedGV = new GlobalVariable(
+        M, mergedAT, false, byteGV->getLinkage(),
+        UndefValue::get(mergedAT), byteGV->getName().str(),
+        byteGV, GlobalVariable::NotThreadLocal, 3);
+    mergedGV->setAlignment(byteGV->getAlign());
+
+    SmallVector<GetElementPtrInst *, 16> byteGEPs;
+    for (auto *U : byteGV->users())
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(U))
+        byteGEPs.push_back(GEP);
+
+    for (auto *GEP : byteGEPs) {
+      if (GEP->getPointerOperand() != byteGV) continue;
+      IRBuilder<> B(GEP);
+      Type *srcTy = GEP->getSourceElementType();
+
+      if (srcTy == byteAT) {
+        Value *byteIdx = GEP->getNumIndices() >= 2
+                             ? GEP->getOperand(2)
+                             : ConstantInt::get(Type::getInt64Ty(Ctx), 0);
+        Value *floatIdx;
+        if (auto *CI = dyn_cast<ConstantInt>(byteIdx))
+          floatIdx = ConstantInt::get(CI->getType(), CI->getZExtValue() / 4);
+        else
+          floatIdx = B.CreateLShr(byteIdx, ConstantInt::get(byteIdx->getType(), 2));
+        auto *newGEP = GetElementPtrInst::CreateInBounds(
+            mergedAT, mergedGV,
+            {ConstantInt::get(Type::getInt64Ty(Ctx), 0), floatIdx},
+            GEP->getName());
+        newGEP->insertBefore(B.GetInsertPoint());
+        GEP->replaceAllUsesWith(newGEP);
+        GEP->eraseFromParent();
+      } else if (srcTy->isIntegerTy(8)) {
+        Value *byteIdx = GEP->getOperand(1);
+        Value *floatIdx;
+        if (auto *CI = dyn_cast<ConstantInt>(byteIdx))
+          floatIdx = ConstantInt::get(CI->getType(), CI->getZExtValue() / 4);
+        else
+          floatIdx = B.CreateLShr(byteIdx, ConstantInt::get(byteIdx->getType(), 2));
+        auto *newGEP = GetElementPtrInst::CreateInBounds(
+            Type::getFloatTy(Ctx), mergedGV, floatIdx, GEP->getName());
+        newGEP->insertBefore(B.GetInsertPoint());
+        GEP->replaceAllUsesWith(newGEP);
+        GEP->eraseFromParent();
+      } else {
+        GEP->setOperand(0, mergedGV);
+      }
+    }
+
+    if (byteGV->use_empty()) byteGV->eraseFromParent();
+    mmaGV->replaceAllUsesWith(mergedGV);
+    mmaGV->eraseFromParent();
+    byteGlobals.clear();
+    changed = true;
+  }
+
+  // Re-collect byte globals after potential merge
+  byteGlobals.clear();
   for (auto &GV : M.globals()) {
     if (GV.getAddressSpace() != 3) continue;
     auto *AT = dyn_cast<ArrayType>(GV.getValueType());
@@ -96,10 +263,127 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
   SmallPtrSet<GlobalVariable *, 4> handledGlobals;
 
   for (auto *GV : byteGlobals) {
+    expandConstantExprUsers(GV);
+
     Type *storeTy = inferTGElementType(GV);
     if (!storeTy) continue;
 
-    expandConstantExprUsers(GV);
+    // Check ALL store/load types through the global. If there's a mix
+    // of scalar and vector (>1 element) types, skip retyping — the typed
+    // pointer mismatch causes materializeAll.
+    {
+      SmallPtrSet<Type *, 4> storeTypes;
+      std::function<void(Value *)> collectTypes = [&](Value *V) {
+        for (auto *U : V->users()) {
+          if (auto *SI = dyn_cast<StoreInst>(U))
+            if (SI->getPointerOperand() == V)
+              storeTypes.insert(SI->getValueOperand()->getType());
+          if (auto *LI = dyn_cast<LoadInst>(U))
+            storeTypes.insert(LI->getType());
+          if (isa<GetElementPtrInst>(U))
+            collectTypes(U);
+        }
+      };
+      collectTypes(GV);
+      // Mixed types: either scalar+vector or multiple different scalar types
+      // (e.g., float + i32 in argmin/argmax). All need bitcast insertion.
+      bool isMixed = storeTypes.size() > 1;
+      if (isMixed) {
+        // Mixed types: insert bitcast ptr→ptr before each store/load
+        // whose type differs from the GEP source type (i8).
+        // In Metal v1 bitcode these bitcasts change the typed pointer.
+        std::function<void(Value *)> insertBitcasts = [&](Value *V) {
+          for (auto *U : make_early_inc_range(V->users())) {
+            if (auto *SI = dyn_cast<StoreInst>(U)) {
+              if (SI->getPointerOperand() == V &&
+                  !SI->getValueOperand()->getType()->isIntegerTy(8)) {
+                auto *BC = new BitCastInst(V, V->getType(), "");
+                BC->insertBefore(SI->getIterator());
+                SI->setOperand(1, BC);
+                changed = true;
+              }
+            } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+              if (!LI->getType()->isIntegerTy(8)) {
+                auto *BC = new BitCastInst(V, V->getType(), "");
+                BC->insertBefore(LI->getIterator());
+                LI->setOperand(0, BC);
+                changed = true;
+              }
+            } else if (isa<GetElementPtrInst>(U)) {
+              insertBitcasts(U);
+            }
+          }
+        };
+        insertBitcasts(GV);
+        continue;
+      }
+    }
+
+    // Scalarize <1 x T> store/load for THIS global before retyping.
+    // After retype, pointer is typed as T* — <1 x T> through T* crashes.
+    {
+      SmallVector<Instruction *, 8> vec1Users;
+      std::function<void(Value *)> findVec1 = [&](Value *V) {
+        for (auto *U : V->users()) {
+          if (auto *SI = dyn_cast<StoreInst>(U)) {
+            if (SI->getPointerOperand() == V) {
+              auto *VT = dyn_cast<FixedVectorType>(SI->getValueOperand()->getType());
+              if (VT && VT->getNumElements() == 1) vec1Users.push_back(SI);
+            }
+          } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+            auto *VT = dyn_cast<FixedVectorType>(LI->getType());
+            if (VT && VT->getNumElements() == 1) vec1Users.push_back(LI);
+          } else if (isa<GetElementPtrInst>(U)) {
+            findVec1(U);
+          }
+        }
+      };
+      findVec1(GV);
+      for (auto *I : vec1Users) {
+        if (auto *SI = dyn_cast<StoreInst>(I)) {
+          IRBuilder<> B(SI);
+          Value *scalar = B.CreateExtractElement(SI->getValueOperand(),
+              ConstantInt::get(I32, 0));
+          B.CreateAlignedStore(scalar, SI->getPointerOperand(),
+              SI->getAlign(), SI->isVolatile());
+          SI->eraseFromParent();
+          changed = true;
+        } else if (auto *LI = dyn_cast<LoadInst>(I)) {
+          IRBuilder<> B(LI);
+          auto *VT = cast<FixedVectorType>(LI->getType());
+          auto *scalar = B.CreateAlignedLoad(VT->getElementType(),
+              LI->getPointerOperand(), LI->getAlign(), LI->isVolatile());
+          Value *vec = B.CreateInsertElement(
+              UndefValue::get(VT), scalar, ConstantInt::get(I32, 0));
+          LI->replaceAllUsesWith(vec);
+          LI->eraseFromParent();
+          changed = true;
+        }
+      }
+    }
+    // Fold extract(insert(undef, x, 0), 0) → x
+    for (auto &F : M) {
+      for (auto &BB : F) {
+        for (auto it = BB.begin(); it != BB.end();) {
+          Instruction &I = *it++;
+          if (auto *EE = dyn_cast<ExtractElementInst>(&I)) {
+            if (auto *IE = dyn_cast<InsertElementInst>(EE->getVectorOperand())) {
+              auto *VT = dyn_cast<FixedVectorType>(IE->getType());
+              if (VT && VT->getNumElements() == 1) {
+                EE->replaceAllUsesWith(IE->getOperand(1));
+                EE->eraseFromParent();
+                if (IE->use_empty()) IE->eraseFromParent();
+                changed = true;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Re-infer storeTy after scalarization (<1 x float> → float)
+    storeTy = inferTGElementType(GV);
+    if (!storeTy) continue;
 
     auto *oldAT = cast<ArrayType>(GV->getValueType());
     uint64_t totalBytes = oldAT->getNumElements();

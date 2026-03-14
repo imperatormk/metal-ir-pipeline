@@ -231,7 +231,7 @@ PreservedAnalyses AIRSystemValuesPass::run(Module &M,
         StringRef argName = F.getArg(i)->getName();
         if (argName.empty()) {
           static char nameBuf[16];
-          snprintf(nameBuf, sizeof(nameBuf), "arg%u", i);
+          snprintf(nameBuf, sizeof(nameBuf), "%u", i);
           argName = nameBuf;
         }
         const char *accessMode = (AS == 2) ? air::kMDRead : air::kMDReadWrite;
@@ -279,17 +279,12 @@ PreservedAnalyses AIRSystemValuesPass::run(Module &M,
         else
           continue;
 
-        // System value — full metadata matching Metal compiler output
+        // System value — no arg_type_size/align (matching MetalASM)
         StringRef typeName = (name == "simdlane") ? "uint" : "uint3";
-        unsigned typeSize = (name == "simdlane") ? 4 : 4; // uint or uint3 component
         paramNodes.push_back(MDNode::get(
             Ctx, {ConstantAsMetadata::get(
                       ConstantInt::get(I32, Arg.getArgNo())),
                   MDString::get(Ctx, airAttr),
-                  MDString::get(Ctx, air::kMDArgTypeSize),
-                  ConstantAsMetadata::get(ConstantInt::get(I32, typeSize)),
-                  MDString::get(Ctx, air::kMDArgTypeAlignSize),
-                  ConstantAsMetadata::get(ConstantInt::get(I32, typeSize)),
                   MDString::get(Ctx, air::kMDArgTypeName),
                   MDString::get(Ctx, typeName),
                   MDString::get(Ctx, air::kMDArgName),
@@ -312,6 +307,17 @@ PreservedAnalyses AIRSystemValuesPass::run(Module &M,
     VerMD->addOperand(MDNode::get(
         Ctx, {ConstantAsMetadata::get(ConstantInt::get(I32, 2)),
               ConstantAsMetadata::get(ConstantInt::get(I32, 8)),
+              ConstantAsMetadata::get(ConstantInt::get(I32, 0))}));
+    changed = true;
+  }
+
+  // Language version metadata (required for PSO creation)
+  if (!M.getNamedMetadata(air::kNMDLanguageVersion)) {
+    auto *LangMD = M.getOrInsertNamedMetadata(air::kNMDLanguageVersion);
+    LangMD->addOperand(MDNode::get(
+        Ctx, {MDString::get(Ctx, "Metal"),
+              ConstantAsMetadata::get(ConstantInt::get(I32, 3)),
+              ConstantAsMetadata::get(ConstantInt::get(I32, 2)),
               ConstantAsMetadata::get(ConstantInt::get(I32, 0))}));
     changed = true;
   }
