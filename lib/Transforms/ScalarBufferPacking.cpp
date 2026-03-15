@@ -124,6 +124,9 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
       if (T->isPointerTy()) {
         if (T->getPointerAddressSpace() == 2) {
           Type *loadTy = inferConstPtrLoadType(F, i);
+          // If inferred type is a pointer, use i64 (pointers are 64-bit)
+          if (loadTy && loadTy->isPointerTy())
+            loadTy = Type::getInt64Ty(M.getContext());
           scalarParams.push_back({i,
               loadTy ? loadTy : Type::getInt32Ty(M.getContext()),
               true, loadTy == nullptr});
@@ -152,29 +155,27 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
     Type *bufElemTy = Type::getFloatTy(M.getContext());
     unsigned bufElemSize = 4;
 
-    // Build new param list: remove all scalar params, add ONE ptr AS(1)
+    // Build new param list: remove all scalar params, add ONE ptr AS(1) at END.
+    // The Python driver passes (ptr0, ptr1, ..., scalar_buf), so the packed
+    // scalar buffer must be the LAST device buffer param (before system values).
     SmallDenseSet<unsigned, 8> scalarIdxSet;
     for (auto &sp : scalarParams) scalarIdxSet.insert(sp.origIdx);
 
     SmallVector<Type *, 8> newParamTypes;
     SmallVector<unsigned, 8> oldToNew(F.arg_size(), UINT_MAX);
-    bool bufInserted = false;
     unsigned bufNewIdx = UINT_MAX;
     unsigned ni = 0;
+    // First pass: add all non-scalar params (device ptrs, system values, etc.)
     for (unsigned i = 0; i < F.arg_size(); i++) {
-      if (scalarIdxSet.count(i)) {
-        if (!bufInserted) {
-          bufNewIdx = ni;
-          newParamTypes.push_back(PointerType::get(M.getContext(), 1));
-          ni++;
-          bufInserted = true;
-        }
-      } else {
-        oldToNew[i] = ni;
-        newParamTypes.push_back(F.getArg(i)->getType());
-        ni++;
-      }
+      if (scalarIdxSet.count(i)) continue;
+      oldToNew[i] = ni;
+      newParamTypes.push_back(F.getArg(i)->getType());
+      ni++;
     }
+    // Then append the packed scalar buffer
+    bufNewIdx = ni;
+    newParamTypes.push_back(PointerType::get(M.getContext(), 1));
+    ni++;
 
     // Save names before splice
     SmallVector<std::string, 8> oldArgNames;
@@ -236,7 +237,23 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
         loaded = ld;
       } else {
         unsigned scalarBits = sp.scalarType->getScalarSizeInBits();
-        if (scalarBits == 32) {
+        if (sp.scalarType->isPointerTy()) {
+          // Pointer: load as i64 (ptrtoint), then inttoptr
+          auto *rawLoad = new LoadInst(bufElemTy, gep, name + "_raw", false, Align(4));
+          preamble.push_back(rawLoad);
+          auto *asI32 = CastInst::Create(Instruction::BitCast, rawLoad,
+                                          Type::getInt32Ty(M.getContext()),
+                                          name + "_i32");
+          preamble.push_back(asI32);
+          auto *asI64 = CastInst::Create(Instruction::ZExt, asI32,
+                                          Type::getInt64Ty(M.getContext()),
+                                          name + "_i64");
+          preamble.push_back(asI64);
+          auto *ptr = CastInst::Create(Instruction::IntToPtr, asI64,
+                                        sp.scalarType, name);
+          preamble.push_back(ptr);
+          loaded = ptr;
+        } else if (scalarBits == 32) {
           // Same size as float: bitcast (float↔i32)
           auto *rawLoad = new LoadInst(bufElemTy, gep, name + "_raw", false, Align(4));
           preamble.push_back(rawLoad);

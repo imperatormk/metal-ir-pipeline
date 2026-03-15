@@ -222,7 +222,7 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
       } else if (auto *AI = dyn_cast<AllocaInst>(&I)) {
         V.push_back(E.typeIdx(AI->getAllocatedType()));
         V.push_back(E.typeIdx(AI->getArraySize()->getType()));
-        V.push_back(getID(AI->getArraySize()));
+        V.push_back(getAbsID(AI->getArraySize()));
         V.push_back((1 << 6) | (Log2_32(AI->getAlign().value()) + 1));
         W.EmitRecord(bitc::FUNC_CODE_INST_ALLOCA, V);
       }

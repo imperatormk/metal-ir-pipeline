@@ -71,19 +71,48 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
           continue;
         }
 
-        // Insert bitcast ptr→ptr before store of non-float to device pointer.
-        // Metal v1 typed pointers default to float* for device (AS1) params.
-        // Storing non-float (e.g., i32 from cmpxchg) needs a bitcast to
-        // change the typed pointer, matching MetalASM behavior.
+        // Insert bitcast ptr→ptr before store when the pointer's typed
+        // pointee differs from the stored value type. Covers:
+        // - Device (AS1): non-float store through float* param
+        // - Threadgroup (AS3): bfloat store through half* TG global
+        // Metal v1 typed pointers require explicit bitcast to change type.
         if (auto *SI = dyn_cast<StoreInst>(&I)) {
           Value *ptr = SI->getPointerOperand();
-          Type *valTy = SI->getValueOperand()->getType();
-          if (ptr->getType()->getPointerAddressSpace() == 1 &&
-              !valTy->isFloatTy() && !isa<BitCastInst>(ptr)) {
-            auto *BC = CastInst::Create(Instruction::BitCast, ptr,
-                                        ptr->getType(), "", SI);
-            SI->setOperand(1, BC);
-            changed = true;
+          unsigned AS = ptr->getType()->getPointerAddressSpace();
+          if ((AS == 1 || AS == 3) && !isa<BitCastInst>(ptr)) {
+            // Check if GEP source type differs from store value type
+            Type *valTy = SI->getValueOperand()->getType();
+            bool needsBitcast = false;
+            if (AS == 1 && !valTy->isFloatTy())
+              needsBitcast = true;
+            if (AS == 3) {
+              if (auto *GEP = dyn_cast<GetElementPtrInst>(ptr))
+                if (GEP->getSourceElementType() != valTy)
+                  needsBitcast = true;
+            }
+            if (needsBitcast) {
+              auto *BC = CastInst::Create(Instruction::BitCast, ptr,
+                                          ptr->getType(), "", SI);
+              SI->setOperand(1, BC);
+              changed = true;
+            }
+          }
+          continue;
+        }
+
+        // Insert bitcast ptr→ptr before load from TG memory when the
+        // GEP source type differs from the loaded value type.
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          Value *ptr = LI->getPointerOperand();
+          if (ptr->getType()->getPointerAddressSpace() == 3 &&
+              !isa<BitCastInst>(ptr)) {
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(ptr))
+              if (GEP->getSourceElementType() != LI->getType()) {
+                auto *BC = CastInst::Create(Instruction::BitCast, ptr,
+                                            ptr->getType(), "", LI);
+                LI->setOperand(0, BC);
+                changed = true;
+              }
           }
           continue;
         }
