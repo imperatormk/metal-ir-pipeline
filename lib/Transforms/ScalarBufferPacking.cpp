@@ -272,10 +272,18 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
           preamble.push_back(asI32);
           // i32 → target type
           if (sp.scalarType->isIntegerTy()) {
-            auto *trunc = CastInst::Create(Instruction::Trunc, asI32,
+            unsigned targetBits = sp.scalarType->getIntegerBitWidth();
+            Instruction::CastOps op;
+            if (targetBits < 32)
+              op = Instruction::Trunc;
+            else if (targetBits > 32)
+              op = Instruction::ZExt;
+            else
+              op = Instruction::BitCast;
+            auto *conv = CastInst::Create(op, asI32,
                                             sp.scalarType, name);
-            preamble.push_back(trunc);
-            loaded = trunc;
+            preamble.push_back(conv);
+            loaded = conv;
           } else if (sp.scalarType->isHalfTy() || sp.scalarType->isBFloatTy()) {
             auto *asI16 = CastInst::Create(Instruction::Trunc, asI32,
                                             Type::getInt16Ty(M.getContext()),
