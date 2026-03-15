@@ -35,7 +35,7 @@ static Type *inferTGElementType(Value *V) {
         return SI->getValueOperand()->getType();
     if (auto *LI = dyn_cast<LoadInst>(U))
       return LI->getType();
-    if (isa<GetElementPtrInst>(U) || isa<GEPOperator>(U))
+    if (isa<GetElementPtrInst>(U) || isa<GEPOperator>(U) || isa<BitCastInst>(U))
       if (Type *T = inferTGElementType(U))
         return T;
   }
@@ -95,6 +95,120 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
       byteGlobals.push_back(&GV);
     else
       mmaGlobals.push_back(&GV);
+  }
+
+  // ── Early split for mixed-type byte globals ────────────────────
+  // cummax-style kernels use a single [N x i8] global for two data types
+  // (e.g., float values at offset K, i64 indices at offset 0). Split
+  // these into separate typed globals BEFORE the merge step, so each
+  // region can be merged/retyped independently.
+  for (size_t gi = 0; gi < byteGlobals.size(); gi++) {
+    auto *GV = byteGlobals[gi];
+    expandConstantExprUsers(GV);
+    auto *oldAT = cast<ArrayType>(GV->getValueType());
+    uint64_t totalBytes = oldAT->getNumElements();
+
+    // Collect store/load types at different constant base offsets
+    SmallPtrSet<Type *, 4> allScalarTypes;
+    SmallVector<int64_t, 4> constOffsets;
+    bool hasNonConstBase = false;
+    std::function<void(Value *, int64_t)> collectTypes = [&](Value *V, int64_t baseOff) {
+      for (auto *U : V->users()) {
+        if (auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand() == V) {
+            Type *T = SI->getValueOperand()->getType();
+            if (T->isIntegerTy() || T->isFloatingPointTy())
+              allScalarTypes.insert(T);
+          }
+        } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+          Type *T = LI->getType();
+          if (T->isIntegerTy() || T->isFloatingPointTy())
+            allScalarTypes.insert(T);
+        } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+          APInt off(64, 0);
+          if (GEP->accumulateConstantOffset(DL, off)) {
+            int64_t byteOff = off.getSExtValue();
+            if (byteOff != 0) constOffsets.push_back(byteOff);
+            collectTypes(GEP, baseOff + byteOff);
+          } else {
+            // Dynamic index GEP — walk its users
+            collectTypes(GEP, baseOff);
+          }
+        } else if (isa<BitCastInst>(U)) {
+          collectTypes(U, baseOff);
+        }
+      }
+    };
+    collectTypes(GV, 0);
+
+    if (allScalarTypes.size() <= 1 || constOffsets.empty()) continue;
+
+    // Mixed types with constant offsets — split
+    llvm::sort(constOffsets);
+    constOffsets.erase(std::unique(constOffsets.begin(), constOffsets.end()),
+                       constOffsets.end());
+
+    DenseMap<int64_t, GlobalVariable *> splitMap;
+    for (int64_t off : constOffsets) {
+      uint64_t regionSize = totalBytes - off;
+      if (regionSize == 0) continue;
+      auto *splitAT = ArrayType::get(Type::getInt8Ty(Ctx), regionSize);
+      auto *splitGV = new GlobalVariable(
+          M, splitAT, false, GV->getLinkage(),
+          UndefValue::get(splitAT),
+          GV->getName() + "__off" + Twine(off),
+          GV, GlobalVariable::NotThreadLocal, 3);
+      splitGV->setAlignment(GV->getAlign());
+      splitMap[off] = splitGV;
+    }
+
+    // Shrink original to first offset
+    auto *newAT = ArrayType::get(Type::getInt8Ty(Ctx), constOffsets[0]);
+    auto *newGV = new GlobalVariable(
+        M, newAT, false, GV->getLinkage(),
+        UndefValue::get(newAT), GV->getName().str(),
+        GV, GlobalVariable::NotThreadLocal, 3);
+    newGV->setAlignment(GV->getAlign());
+
+    // Rewrite GEPs
+    SmallVector<GetElementPtrInst *, 8> users;
+    for (auto *U : GV->users())
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(U))
+        users.push_back(GEP);
+
+    for (auto *GEP : users) {
+      if (GEP->getPointerOperand() != GV) continue;
+      APInt off(64, 0);
+      if (GEP->accumulateConstantOffset(DL, off)) {
+        int64_t byteOff = off.getSExtValue();
+        if (byteOff == 0) {
+          GEP->setOperand(0, newGV);
+          if (GEP->getSourceElementType() == oldAT)
+            GEP->setSourceElementType(newAT);
+          changed = true;
+        } else {
+          auto sit = splitMap.find(byteOff);
+          if (sit == splitMap.end()) continue;
+          GEP->replaceAllUsesWith(sit->second);
+          GEP->eraseFromParent();
+          changed = true;
+        }
+      } else {
+        // Dynamic GEP at base offset 0
+        GEP->setOperand(0, newGV);
+        if (GEP->getSourceElementType() == oldAT)
+          GEP->setSourceElementType(newAT);
+        changed = true;
+      }
+    }
+
+    if (GV->use_empty()) GV->eraseFromParent();
+
+    // Update byteGlobals: replace old with new + splits
+    byteGlobals[gi] = newGV;
+    for (auto &kv : splitMap)
+      byteGlobals.push_back(kv.second);
+    changed = true;
   }
 
   // ── Byte→MMA merge ─────────────────────────────────────────────
@@ -180,8 +294,41 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
       }
     }
   }
+  // After early split, try to merge each remaining byte global with
+  // the MMA global if types are compatible and it saves TG memory.
   if (!byteGlobals.empty() && mmaGlobals.size() == 1 && !hasWideVec) {
-    auto *byteGV = byteGlobals[0];
+    // Find the best byte global to merge: the one whose inferred type
+    // matches the MMA element type, or the largest one.
+    auto *mmaGVCandidate = mmaGlobals[0];
+    auto *mmaATCandidate = cast<ArrayType>(mmaGVCandidate->getValueType());
+    Type *mmaElemTy = mmaATCandidate->getElementType();
+
+    int bestIdx = -1;
+    uint64_t bestBytes = 0;
+    for (int i = 0; i < (int)byteGlobals.size(); i++) {
+      auto *bAT = cast<ArrayType>(byteGlobals[i]->getValueType());
+      uint64_t bBytes = bAT->getNumElements();
+      // Prefer type-compatible merge (inferred type matches MMA element)
+      Type *inferred = inferTGElementType(byteGlobals[i]);
+      bool typeMatch = inferred && (inferred == mmaElemTy ||
+          (inferred->isIntegerTy(32) && mmaElemTy->isFloatTy()) ||
+          (inferred->isFloatTy() && mmaElemTy->isIntegerTy(32)));
+      if (typeMatch && bBytes > bestBytes) {
+        bestIdx = i;
+        bestBytes = bBytes;
+      }
+    }
+    // If no type match found, fall back to largest byte global (original behavior)
+    if (bestIdx < 0) {
+      for (int i = 0; i < (int)byteGlobals.size(); i++) {
+        auto *bAT = cast<ArrayType>(byteGlobals[i]->getValueType());
+        if (bAT->getNumElements() > bestBytes) {
+          bestBytes = bAT->getNumElements();
+          bestIdx = i;
+        }
+      }
+    }
+    auto *byteGV = byteGlobals[bestIdx >= 0 ? bestIdx : 0];
     auto *mmaGV = mmaGlobals[0];
     auto *byteAT = cast<ArrayType>(byteGV->getValueType());
     auto *mmaAT = cast<ArrayType>(mmaGV->getValueType());
@@ -189,9 +336,17 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
     uint64_t byteBytes = byteAT->getNumElements();
     unsigned mmaElemSize = DL.getTypeAllocSize(mmaAT->getElementType());
     uint64_t mmaBytes = mmaAT->getNumElements() * mmaElemSize;
-    uint64_t floatCount = (std::max(byteBytes, mmaBytes) + 3) / 4;
+    // Use MMA element type for the merged global (may be float, i64, etc.)
+    Type *mergeElemTy = mmaElemTy;
+    unsigned mergeElemSize = mmaElemSize;
+    // Fall back to float if MMA type is unusual
+    if (mergeElemSize == 0) {
+      mergeElemTy = Type::getFloatTy(Ctx);
+      mergeElemSize = 4;
+    }
+    uint64_t mergedElemCount = (std::max(byteBytes, mmaBytes) + mergeElemSize - 1) / mergeElemSize;
 
-    auto *mergedAT = ArrayType::get(Type::getFloatTy(Ctx), floatCount);
+    auto *mergedAT = ArrayType::get(mergeElemTy, mergedElemCount);
     expandConstantExprUsers(byteGV);
 
     auto *mergedGV = new GlobalVariable(
@@ -214,27 +369,27 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
         Value *byteIdx = GEP->getNumIndices() >= 2
                              ? GEP->getOperand(2)
                              : ConstantInt::get(Type::getInt64Ty(Ctx), 0);
-        Value *floatIdx;
+        Value *elemIdx;
         if (auto *CI = dyn_cast<ConstantInt>(byteIdx))
-          floatIdx = ConstantInt::get(CI->getType(), CI->getZExtValue() / 4);
+          elemIdx = ConstantInt::get(CI->getType(), CI->getZExtValue() / mergeElemSize);
         else
-          floatIdx = B.CreateLShr(byteIdx, ConstantInt::get(byteIdx->getType(), 2));
+          elemIdx = B.CreateUDiv(byteIdx, ConstantInt::get(byteIdx->getType(), mergeElemSize));
         auto *newGEP = GetElementPtrInst::CreateInBounds(
             mergedAT, mergedGV,
-            {ConstantInt::get(Type::getInt64Ty(Ctx), 0), floatIdx},
+            {ConstantInt::get(Type::getInt64Ty(Ctx), 0), elemIdx},
             GEP->getName());
         newGEP->insertBefore(B.GetInsertPoint());
         GEP->replaceAllUsesWith(newGEP);
         GEP->eraseFromParent();
       } else if (srcTy->isIntegerTy(8)) {
         Value *byteIdx = GEP->getOperand(1);
-        Value *floatIdx;
+        Value *elemIdx;
         if (auto *CI = dyn_cast<ConstantInt>(byteIdx))
-          floatIdx = ConstantInt::get(CI->getType(), CI->getZExtValue() / 4);
+          elemIdx = ConstantInt::get(CI->getType(), CI->getZExtValue() / mergeElemSize);
         else
-          floatIdx = B.CreateLShr(byteIdx, ConstantInt::get(byteIdx->getType(), 2));
+          elemIdx = B.CreateUDiv(byteIdx, ConstantInt::get(byteIdx->getType(), mergeElemSize));
         auto *newGEP = GetElementPtrInst::CreateInBounds(
-            Type::getFloatTy(Ctx), mergedGV, floatIdx, GEP->getName());
+            mergeElemTy, mergedGV, elemIdx, GEP->getName());
         newGEP->insertBefore(B.GetInsertPoint());
         GEP->replaceAllUsesWith(newGEP);
         GEP->eraseFromParent();
@@ -246,7 +401,11 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
     if (byteGV->use_empty()) byteGV->eraseFromParent();
     mmaGV->replaceAllUsesWith(mergedGV);
     mmaGV->eraseFromParent();
-    byteGlobals.clear();
+    // Remove merged byte global from list
+    if (bestIdx >= 0)
+      byteGlobals.erase(byteGlobals.begin() + bestIdx);
+    else
+      byteGlobals.clear();
     changed = true;
   }
 
@@ -456,6 +615,26 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
         changed = true;
       }
 
+      // Redirect remaining direct (non-GEP) instruction uses of the old
+      // global to the new typed global. These are loads/stores at offset 0
+      // that don't go through a GEP (e.g., `load i32, @global_smem`).
+      {
+        SmallVector<Instruction *, 4> directUsers;
+        for (auto *U : GV->users()) {
+          auto *I = dyn_cast<Instruction>(U);
+          if (!I) continue;
+          if (isa<GetElementPtrInst>(I)) continue;  // already handled
+          directUsers.push_back(I);
+        }
+        for (auto *I : directUsers) {
+          for (unsigned op = 0; op < I->getNumOperands(); op++) {
+            if (I->getOperand(op) == GV)
+              I->setOperand(op, newGV);
+          }
+          changed = true;
+        }
+      }
+
       if (GV->use_empty()) GV->eraseFromParent();
 
       // Clean up any remaining i8 GEPs in the chain of the new global.
@@ -564,6 +743,87 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
     }
 
     if (GV->use_empty()) GV->eraseFromParent();
+
+    // Retype split globals: [N x i8] → [M x T] based on store/load types.
+    // This enables proper typed pointers in Metal bitcode.
+    SmallVector<GlobalVariable *, 4> toRetype;
+    toRetype.push_back(newGV);
+    for (auto &kv : splitMap)
+      toRetype.push_back(kv.second);
+    for (auto *splitGV : toRetype) {
+      Type *elemTy = inferTGElementType(splitGV);
+      if (!elemTy) continue;
+      if (elemTy->isBFloatTy()) elemTy = Type::getHalfTy(Ctx);
+      unsigned eSize = DL.getTypeAllocSize(elemTy);
+      if (eSize == 0) continue;
+      auto *splitOldAT = cast<ArrayType>(splitGV->getValueType());
+      uint64_t nBytes = splitOldAT->getNumElements();
+      uint64_t nElems = nBytes / eSize;
+      if (nElems == 0) continue;
+      auto *typedAT = ArrayType::get(elemTy, nElems);
+      auto *typedGV = new GlobalVariable(
+          M, typedAT, false, splitGV->getLinkage(),
+          UndefValue::get(typedAT), splitGV->getName().str() + ".typed",
+          splitGV, GlobalVariable::NotThreadLocal, 3);
+      typedGV->setAlignment(splitGV->getAlign());
+
+      SmallVector<GetElementPtrInst *, 8> splitUsers;
+      for (auto *U : splitGV->users())
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(U))
+          splitUsers.push_back(GEP);
+      for (auto *GEP : splitUsers) {
+        if (GEP->getPointerOperand() != splitGV) continue;
+        IRBuilder<> B(GEP);
+        Type *srcTy = GEP->getSourceElementType();
+        if (srcTy == splitOldAT) {
+          Value *byteIdx = GEP->getNumIndices() >= 2
+                               ? GEP->getOperand(2)
+                               : ConstantInt::get(Type::getInt64Ty(Ctx), 0);
+          Value *eIdx;
+          if (auto *CI = dyn_cast<ConstantInt>(byteIdx))
+            eIdx = ConstantInt::get(CI->getType(), CI->getZExtValue() / eSize);
+          else
+            eIdx = B.CreateUDiv(byteIdx, ConstantInt::get(byteIdx->getType(), eSize));
+          auto *nGEP = GetElementPtrInst::CreateInBounds(
+              typedAT, typedGV,
+              {ConstantInt::get(Type::getInt64Ty(Ctx), 0), eIdx},
+              GEP->getName());
+          nGEP->insertBefore(B.GetInsertPoint());
+          GEP->replaceAllUsesWith(nGEP);
+          GEP->eraseFromParent();
+        } else if (srcTy->isIntegerTy(8)) {
+          Value *byteIdx = GEP->getOperand(1);
+          Value *eIdx;
+          if (auto *CI = dyn_cast<ConstantInt>(byteIdx))
+            eIdx = ConstantInt::get(CI->getType(), CI->getZExtValue() / eSize);
+          else
+            eIdx = B.CreateUDiv(byteIdx, ConstantInt::get(byteIdx->getType(), eSize));
+          auto *nGEP = GetElementPtrInst::CreateInBounds(
+              elemTy, typedGV, eIdx, GEP->getName());
+          nGEP->insertBefore(B.GetInsertPoint());
+          GEP->replaceAllUsesWith(nGEP);
+          GEP->eraseFromParent();
+        } else {
+          // Non-i8, non-array GEP: redirect pointer
+          GEP->setOperand(0, typedGV);
+        }
+        changed = true;
+      }
+      // Redirect any remaining direct users (non-GEP)
+      SmallVector<Instruction *, 4> directUsers;
+      for (auto *U : splitGV->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I || isa<GetElementPtrInst>(I)) continue;
+        directUsers.push_back(I);
+      }
+      for (auto *I : directUsers) {
+        for (unsigned op = 0; op < I->getNumOperands(); op++)
+          if (I->getOperand(op) == splitGV)
+            I->setOperand(op, typedGV);
+        changed = true;
+      }
+      if (splitGV->use_empty()) splitGV->eraseFromParent();
+    }
   }
 
   // ── Phase 2: Preamble GEPs for array TG globals ─────────────────

@@ -118,6 +118,67 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
     };
     SmallVector<ScalarParam, 8> scalarParams;
 
+    // Identify descriptor groups to infer types for dead params.
+    // Matches the Python driver's _expand_descriptor layout by pattern-
+    // matching param groups. Consider passing descriptor types explicitly
+    // from Python (via IR metadata) to avoid coupling with driver layout.
+    // Between consecutive device pointers (addrspace(1)), scalar params
+    // (addrspace(2)) form a descriptor group. For no-metadata descriptors,
+    // _expand_descriptor produces: [i64×(2N), i1, i1, i32×N, i64×N]
+    // where N = ndim and group_size = 4*N + 2.
+    // We build a lookup from param index → descriptor-pattern type.
+    SmallDenseMap<unsigned, Type *, 16> descriptorTypeForParam;
+    {
+      // Scan for groups of AS(2) params after each AS(1) param
+      unsigned i = 0;
+      while (i < F.arg_size()) {
+        Type *T = F.getArg(i)->getType();
+        bool isDevicePtr = T->isPointerTy() && T->getPointerAddressSpace() == 1;
+        if (isDevicePtr) {
+          // Count consecutive AS(2) params after this device ptr
+          unsigned groupStart = i + 1;
+          unsigned j = groupStart;
+          while (j < F.arg_size()) {
+            Type *Tj = F.getArg(j)->getType();
+            if (!Tj->isPointerTy() || Tj->getPointerAddressSpace() != 2)
+              break;
+            j++;
+          }
+          unsigned count = j - groupStart;
+          // Check if count matches descriptor pattern: count = 4*N + 2
+          if (count >= 2 && (count - 2) % 4 == 0) {
+            unsigned ndim = (count - 2) / 4;
+            // Validate: live params' types must match pattern
+            // Pattern: [i64×(2N), i1, i1, i32×N, i64×N]
+            auto getPatternType = [&](unsigned offset) -> Type * {
+              if (offset < 2 * ndim)
+                return Type::getInt64Ty(M.getContext());
+              if (offset < 2 * ndim + 2)
+                return Type::getInt1Ty(M.getContext());
+              if (offset < 3 * ndim + 2)
+                return Type::getInt32Ty(M.getContext());
+              return Type::getInt64Ty(M.getContext());
+            };
+            bool valid = true;
+            for (unsigned off = 0; off < count; off++) {
+              Type *liveTy = inferConstPtrLoadType(F, groupStart + off);
+              if (liveTy) {
+                // Live param — check that its size matches the pattern
+                auto [liveSize, _a] = scalarSizeAlign(liveTy);
+                auto [patSize, _b] = scalarSizeAlign(getPatternType(off));
+                if (liveSize != patSize) { valid = false; break; }
+              }
+            }
+            if (valid) {
+              for (unsigned off = 0; off < count; off++)
+                descriptorTypeForParam[groupStart + off] = getPatternType(off);
+            }
+          }
+        }
+        i++;
+      }
+    }
+
     for (unsigned i = 0; i < F.arg_size(); i++) {
       if (sysValParams.count(i)) continue;
       Type *T = F.getArg(i)->getType();
@@ -127,9 +188,17 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
           // If inferred type is a pointer, use i64 (pointers are 64-bit)
           if (loadTy && loadTy->isPointerTy())
             loadTy = Type::getInt64Ty(M.getContext());
-          scalarParams.push_back({i,
-              loadTy ? loadTy : Type::getInt32Ty(M.getContext()),
-              true, loadTy == nullptr});
+          if (loadTy) {
+            scalarParams.push_back({i, loadTy, true, false});
+          } else {
+            // Dead param — use descriptor pattern type for correct layout,
+            // fallback to i32 if not part of a recognized descriptor group.
+            Type *deadTy = Type::getInt32Ty(M.getContext());
+            auto it = descriptorTypeForParam.find(i);
+            if (it != descriptorTypeForParam.end())
+              deadTy = it->second;
+            scalarParams.push_back({i, deadTy, true, true});
+          }
         }
         continue;
       }

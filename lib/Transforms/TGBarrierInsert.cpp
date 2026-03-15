@@ -121,6 +121,64 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
         }
       }
     }
+
+    // Strategy 3: WAR hazard — barrier between TG load and TG store
+    // When a block has a TG load and later reaches a TG store (in same
+    // block or successor) without an intervening barrier, insert one.
+    // This prevents a fast warp from overwriting TG data that a slow
+    // warp hasn't read yet (e.g., multi-reduction kernels reusing TG).
+    for (auto &BB : F) {
+      if (!tgLoadBlocks.count(&BB)) continue;
+
+      // Find the last TG load in this block
+      Instruction *lastTGLoad = nullptr;
+      for (auto &I : BB) {
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+          if (LI->getPointerAddressSpace() == 3)
+            lastTGLoad = &I;
+      }
+      if (!lastTGLoad) continue;
+
+      // Check if there's a barrier after the last TG load in this block
+      bool hasBarrierAfterLoad = false;
+      for (auto it = lastTGLoad->getIterator(); it != BB.end(); ++it) {
+        if (isBarrierCall(&*it)) {
+          hasBarrierAfterLoad = true;
+          break;
+        }
+      }
+      if (hasBarrierAfterLoad) continue;
+
+      // Check if any successor has a TG store (directly or via
+      // conditional branch to a TG-store block)
+      auto *term = BB.getTerminator();
+      bool succHasTGStore = false;
+      for (unsigned i = 0; i < term->getNumSuccessors(); i++) {
+        BasicBlock *succ = term->getSuccessor(i);
+        if (tgStoreBlocks.count(succ)) {
+          succHasTGStore = true;
+          break;
+        }
+        // Also check one level deeper: succ branches to TG store
+        if (auto *succBI = dyn_cast<BranchInst>(succ->getTerminator())) {
+          for (unsigned j = 0; j < succBI->getNumSuccessors(); j++) {
+            if (tgStoreBlocks.count(succBI->getSuccessor(j))) {
+              // Only if no barrier in succ before the branch
+              bool succHasBarrier = false;
+              for (auto &SI : *succ)
+                if (isBarrierCall(&SI)) { succHasBarrier = true; break; }
+              if (!succHasBarrier) succHasTGStore = true;
+            }
+          }
+        }
+      }
+
+      if (succHasTGStore) {
+        IRBuilder<> B(term);
+        createBarrier(B, M);
+        changed = true;
+      }
+    }
   }
 
   if (!changed) return PreservedAnalyses::all();

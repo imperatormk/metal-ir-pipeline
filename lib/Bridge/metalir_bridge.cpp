@@ -48,6 +48,13 @@ void *metalir_compile(const char *llText, uint64_t *outLen,
     return nullptr;
   }
 
+  // Debug: dump original IR before transforms
+  if (getenv("METALIR_DUMP_IR")) {
+    std::error_code EC;
+    raw_fd_ostream dump("/tmp/metalir_original.ll", EC);
+    if (!EC) M->print(dump, nullptr);
+  }
+
   // Run the Metal IR pipeline
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;

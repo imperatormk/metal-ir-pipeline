@@ -24,11 +24,13 @@ bool NormalizeAllocasPass::needsRun(Module &M) {
         if (auto *BC = dyn_cast<BitCastInst>(&I))
           if (BC->getSrcTy() == BC->getDestTy())
             return true;
-        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
-          if (GEP->getPointerAddressSpace() == 1 &&
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+          unsigned AS = GEP->getPointerAddressSpace();
+          if ((AS == 1 || AS == 3) &&
               (GEP->getSourceElementType()->isHalfTy() ||
                GEP->getSourceElementType()->isBFloatTy()))
             return true;
+        }
       }
   return false;
 }
@@ -120,7 +122,8 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
         // Fix GEP source type mismatch: gep half, ptr, idx where
         // downstream load/store is float → gep float, ptr, idx/2
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-          if (GEP->getPointerAddressSpace() == 1 &&
+          unsigned AS = GEP->getPointerAddressSpace();
+          if ((AS == 1 || AS == 3) &&
               GEP->getNumIndices() == 1 &&
               (GEP->getSourceElementType()->isHalfTy() ||
                GEP->getSourceElementType()->isBFloatTy())) {
@@ -146,6 +149,16 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
                                                    newIdx, GEP->getName());
               GEP->replaceAllUsesWith(newGEP);
               GEP->eraseFromParent();
+              changed = true;
+            } else if (GEP->getSourceElementType()->isBFloatTy() &&
+                       !isa<BitCastInst>(GEP->getPointerOperand())) {
+              // bfloat GEP through a non-bfloat typed pointer (e.g., float*
+              // from a merged TG global or device param). Insert bitcast
+              // ptr→ptr so Metal v1 bitcode sees the typed pointer change.
+              auto *BC = CastInst::Create(Instruction::BitCast,
+                  GEP->getPointerOperand(),
+                  GEP->getPointerOperand()->getType(), "", GEP);
+              GEP->setOperand(0, BC);
               changed = true;
             }
           }
