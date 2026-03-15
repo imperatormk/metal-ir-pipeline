@@ -117,7 +117,36 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         W.EmitRecord(bitc::FUNC_CODE_INST_STORE, V);
       } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
         V.push_back(GEP->isInBounds() ? 1 : 0);
-        V.push_back(E.typeIdx(GEP->getSourceElementType()));
+        // Metal GPU JIT requires GEP source type to match pointer's pointee
+        // type. For device (AS 1) pointers collapsed to float*, remap i32
+        // GEP source type to float (same 4-byte stride) — but ONLY when
+        // all terminal users (following GEP chains) consume float. If any
+        // terminal user is a non-float load/store/atomic, keep i32.
+        Type *gepSrcTy = GEP->getSourceElementType();
+        if (GEP->getPointerAddressSpace() == 1 &&
+            gepSrcTy->isIntegerTy(32)) {
+          // Walk GEP chains to find terminal (non-GEP) users
+          bool allTerminalFloat = true;
+          SmallVector<const GetElementPtrInst *, 8> worklist;
+          worklist.push_back(GEP);
+          while (!worklist.empty() && allTerminalFloat) {
+            auto *G = worklist.pop_back_val();
+            for (auto *U : G->users()) {
+              if (auto *SubGEP = dyn_cast<GetElementPtrInst>(U)) {
+                worklist.push_back(SubGEP);
+              } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+                if (!LI->getType()->isFloatTy()) { allTerminalFloat = false; break; }
+              } else if (auto *SI = dyn_cast<StoreInst>(U)) {
+                if (!SI->getValueOperand()->getType()->isFloatTy()) { allTerminalFloat = false; break; }
+              } else {
+                allTerminalFloat = false; break;
+              }
+            }
+          }
+          if (allTerminalFloat)
+            gepSrcTy = Type::getFloatTy(F.getContext());
+        }
+        V.push_back(E.typeIdx(gepSrcTy));
         for (auto &Op : GEP->operands()) V.push_back(getID(Op));
         W.EmitRecord(bitc::FUNC_CODE_INST_GEP, V);
       } else if (auto *EE = dyn_cast<ExtractElementInst>(&I)) {

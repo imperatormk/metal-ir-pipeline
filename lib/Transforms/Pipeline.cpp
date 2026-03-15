@@ -73,7 +73,6 @@ void buildMetalIRPipeline(ModulePassManager &MPM) {
   // Phase 5: Type system
   MPM.addPass(InferTypedPointersPass());
   MPM.addPass(MMATypedPointersPass());
-  MPM.addPass(BFloat16CastDecomposePass());
 
   // Phase 6: Kernel ABI
   MPM.addPass(ScalarBufferPackingPass());
@@ -87,7 +86,10 @@ void buildMetalIRPipeline(ModulePassManager &MPM) {
   MPM.addPass(DeviceLoadsVolatilePass());
   MPM.addPass(WidenDeviceLoadsPass());
 
-  // Phase 9: Pre-serialization normalization (part 2, after widening)
+  // Phase 9: Cast decomposition (after WidenDeviceLoads so trunc→sext folds)
+  MPM.addPass(BFloat16CastDecomposePass());
+
+  // Phase 10: Pre-serialization normalization (part 2, after widening)
   MPM.addPass(NormalizeAllocasPass());
 }
 
