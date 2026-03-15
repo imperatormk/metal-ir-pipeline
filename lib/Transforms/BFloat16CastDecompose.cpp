@@ -43,7 +43,15 @@ PreservedAnalyses BFloat16CastDecomposePass::run(Module &M,
           Value *ToFloat = isa<SIToFPInst>(I)
               ? B.CreateSIToFP(I->getOperand(0), F32, "to_f32")
               : B.CreateUIToFP(I->getOperand(0), F32, "to_f32");
-          Value *Trunc = B.CreateFPTrunc(ToFloat, BF16, I->getName());
+          // Decompose f32→bf16 via bit manipulation instead of fptrunc,
+          // because Metal v1 bitcode doesn't support bfloat in CAST ops.
+          // bf16 is just the upper 16 bits of f32.
+          Type *I32T = Type::getInt32Ty(M.getContext());
+          Type *I16T = Type::getInt16Ty(M.getContext());
+          Value *AsInt = B.CreateBitCast(ToFloat, I32T, "f32_bits");
+          Value *Shifted = B.CreateLShr(AsInt, 16, "bf16_bits");
+          Value *Narrow = B.CreateTrunc(Shifted, I16T, "bf16_i16");
+          Value *Trunc = B.CreateBitCast(Narrow, BF16, I->getName());
           I->replaceAllUsesWith(Trunc);
           I->eraseFromParent();
           changed = true;
