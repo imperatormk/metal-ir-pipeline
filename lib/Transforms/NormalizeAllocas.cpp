@@ -71,6 +71,23 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
           continue;
         }
 
+        // Insert bitcast ptr→ptr before store of non-float to device pointer.
+        // Metal v1 typed pointers default to float* for device (AS1) params.
+        // Storing non-float (e.g., i32 from cmpxchg) needs a bitcast to
+        // change the typed pointer, matching MetalASM behavior.
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          Value *ptr = SI->getPointerOperand();
+          Type *valTy = SI->getValueOperand()->getType();
+          if (ptr->getType()->getPointerAddressSpace() == 1 &&
+              !valTy->isFloatTy() && !isa<BitCastInst>(ptr)) {
+            auto *BC = CastInst::Create(Instruction::BitCast, ptr,
+                                        ptr->getType(), "", SI);
+            SI->setOperand(1, BC);
+            changed = true;
+          }
+          continue;
+        }
+
         // Fix GEP source type mismatch: gep half, ptr, idx where
         // downstream load/store is float → gep float, ptr, idx/2
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {

@@ -26,14 +26,17 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
   for (auto &Arg : F.args())
     localMap[&Arg] = nextID++;
 
-  // Collect function-level constants
+  // Collect function-level constants — include constants even if they're
+  // also module constants. Metal v1 bitcode requires function-level
+  // constant entries; referencing module constants directly from function
+  // instructions causes GPU JIT materializeAll failures.
   SmallVector<const Constant *, 32> funcConsts;
   for (auto &BB : F)
     for (auto &I : BB)
       for (auto &Op : I.operands())
         if (auto *C = dyn_cast<Constant>(Op))
           if (!isa<GlobalValue>(C) && !localMap.count(C) &&
-              !E.globalValueMap.count(C) && !E.hasModuleConst(C)) {
+              !E.globalValueMap.count(C)) {
             localMap[C] = nextID++;
             funcConsts.push_back(C);
           }
@@ -220,7 +223,7 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         V.push_back(E.typeIdx(AI->getAllocatedType()));
         V.push_back(E.typeIdx(AI->getArraySize()->getType()));
         V.push_back(getID(AI->getArraySize()));
-        V.push_back(1 << 6); // explicit type flag, no alignment (Metal convention)
+        V.push_back((1 << 6) | (Log2_32(AI->getAlign().value()) + 1));
         W.EmitRecord(bitc::FUNC_CODE_INST_ALLOCA, V);
       }
 

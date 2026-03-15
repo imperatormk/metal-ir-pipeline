@@ -39,31 +39,16 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
   addType(Type::getVoidTy(Ctx));
   addType(Type::getFloatTy(Ctx));
 
-  // Enumerate param types — for pointer params, create per-param
-  // typed pointer entries based on actual usage (not shared default)
-  for (auto &F : M) {
-    for (unsigned i = 0; i < F.getFunctionType()->getNumParams(); i++) {
-      Type *PT = F.getFunctionType()->getParamType(i);
-      if (!PT->isPointerTy()) {
-        addType(PT);
-        continue;
-      }
-      // Infer pointee from usage for this specific param
-      Type *pointee = nullptr;
-      if (!F.isDeclaration() && i < F.arg_size())
-        pointee = pointeeTypeForValue(F.getArg(i));
-      if (!pointee)
-        pointee = pointeeType(PT);
-      ptrTypeIdx(PT, pointee);
-    }
-  }
-
-  // Enumerate function types with per-param pointee awareness.
-  // addFunctionType builds explicit per-param type indices so that
-  // kernels with mixed pointer types (e.g., float* and i32*) get
-  // correct typed pointer entries for each parameter.
+  // Enumerate function types — definitions first, then declarations.
+  // Must process definitions first so their per-param pointee inference
+  // populates funcTypeParamIndices before any recursive addType call
+  // from declaration processing caches the function type with wrong params.
   for (auto &F : M)
-    addFunctionType(F.getFunctionType(), &F);
+    if (!F.isDeclaration())
+      addFunctionType(F.getFunctionType(), &F);
+  for (auto &F : M)
+    if (F.isDeclaration())
+      addFunctionType(F.getFunctionType(), &F);
   // Create function pointer types for definitions (kernels) only.
   // Declarations (intrinsics) don't need function pointers in Metal v1.
   for (auto &F : M)
