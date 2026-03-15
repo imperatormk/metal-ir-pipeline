@@ -45,12 +45,31 @@ hasMMA:
 
 /// Try to decompose a GEP into (base, index, element type).
 /// Returns true if the GEP is a simple `gep <elemTy>, ptr %base, i32 %idx`.
+/// Flattens GEP chains: if %base is itself a GEP with the same element type,
+/// combines the indices so that the word/lane split is computed from the total
+/// element offset from the true base pointer.
 static bool decomposeGEP(GetElementPtrInst *GEP, Value *&base,
                           Value *&index, Type *&elemTy) {
   if (GEP->getNumIndices() != 1) return false;
   base = GEP->getPointerOperand();
   index = GEP->getOperand(1);
   elemTy = GEP->getSourceElementType();
+
+  // Flatten GEP chains: GEP(GEP(base, idx1), idx2) → (base, idx1+idx2)
+  // This is critical for transposed stores where the outer GEP provides
+  // the column offset and the inner GEP provides the row*stride offset,
+  // or vice versa. Without flattening, two adjacent half stores may both
+  // compute the same word index and lane, causing the second to overwrite
+  // the first.
+  while (auto *baseGEP = dyn_cast<GetElementPtrInst>(base)) {
+    if (baseGEP->getNumIndices() != 1) break;
+    if (baseGEP->getSourceElementType() != elemTy) break;
+    // Combine: total index = baseGEP.index + index
+    IRBuilder<> B(GEP);
+    index = B.CreateAdd(baseGEP->getOperand(1), index, "idx_flat");
+    base = baseGEP->getPointerOperand();
+  }
+
   return true;
 }
 
@@ -129,6 +148,36 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
       LI->replaceAllUsesWith(cast);
       LI->eraseFromParent();
       changed = true;
+    } else if (origBits == 8 && GEP && GEP->getSourceElementType() == origTy) {
+      // i8 load: 4 bytes per float. Load float at index/4, extract byte at index%4.
+      // load i8, gep i8 base idx → load float gep float base (idx>>2),
+      //   bitcast to i32, shift right by (lane*8), trunc to i8
+      Value *base, *index;
+      Type *elemTy;
+      if (decomposeGEP(GEP, base, index, elemTy)) {
+        auto *I32 = Type::getInt32Ty(M.getContext());
+        Value *idxShr = B.CreateLShr(index, ConstantInt::get(index->getType(), 2),
+                                      LI->getName() + "_bidx");
+        Value *floatPtr = B.CreateGEP(F32, base, idxShr,
+                                       LI->getName() + "_fp");
+        auto *floatLoad = B.CreateAlignedLoad(F32, floatPtr, Align(4),
+                                               LI->getName() + "_wf");
+        if (LI->isVolatile()) floatLoad->setVolatile(true);
+
+        // bitcast float → i32, shift right by (lane * 8), trunc to i8
+        Value *asI32 = B.CreateBitCast(floatLoad, I32, LI->getName() + "_i32");
+        Value *lane = B.CreateAnd(index, ConstantInt::get(index->getType(), 3),
+                                   LI->getName() + "_lane");
+        Value *shiftAmt = B.CreateShl(lane, ConstantInt::get(lane->getType(), 3),
+                                       LI->getName() + "_sh");
+        Value *shifted = B.CreateLShr(asI32, shiftAmt, LI->getName() + "_sr");
+        Value *elem = B.CreateTrunc(shifted, origTy, LI->getName());
+
+        LI->replaceAllUsesWith(elem);
+        LI->eraseFromParent();
+        if (GEP->use_empty()) GEP->eraseFromParent();
+        changed = true;
+      }
     }
     // For other sizes (16-bit, 64-bit), the half-scaling path above
     // handles 16-bit. 64-bit device loads are rare with MMA.
@@ -186,6 +235,30 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
                             SI->getAlign(), SI->isVolatile());
       SI->eraseFromParent();
       changed = true;
+    }
+  }
+
+  // Clean up dead device-memory GEPs with non-float element types.
+  // GEP flattening can leave intermediate GEPs dead. These must be removed
+  // before serialization because Metal AIR typed pointers may not support
+  // all element types (e.g. half*, bfloat*, i8*).
+  if (changed) {
+    bool progress = true;
+    while (progress) {
+      progress = false;
+      for (auto &F : M)
+        for (auto &BB : F)
+          for (auto II = BB.begin(); II != BB.end(); ) {
+            auto *GEP = dyn_cast<GetElementPtrInst>(&*II++);
+            if (!GEP) continue;
+            if (!GEP->use_empty()) continue;
+            if (GEP->getPointerAddressSpace() != 1) continue;
+            auto *srcTy = GEP->getSourceElementType();
+            if (!srcTy->isFloatTy()) {
+              GEP->eraseFromParent();
+              progress = true;
+            }
+          }
     }
   }
 

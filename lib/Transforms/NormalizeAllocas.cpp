@@ -30,6 +30,19 @@ bool NormalizeAllocasPass::needsRun(Module &M) {
               (GEP->getSourceElementType()->isHalfTy() ||
                GEP->getSourceElementType()->isBFloatTy()))
             return true;
+          // float GEP through bfloat/half typed TG pointer
+          if (AS == 3 && GEP->getSourceElementType()->isFloatTy() &&
+              GEP->getNumIndices() == 1 && !isa<BitCastInst>(GEP->getPointerOperand())) {
+            // Check if pointer traces back to a bfloat/half TG global
+            Value *ptr = GEP->getPointerOperand();
+            if (auto *pGEP = dyn_cast<GetElementPtrInst>(ptr)) {
+              if (auto *GV = dyn_cast<GlobalVariable>(pGEP->getPointerOperand())) {
+                if (auto *AT = dyn_cast<ArrayType>(GV->getValueType()))
+                  if (AT->getElementType()->isBFloatTy() || AT->getElementType()->isHalfTy())
+                    return true;
+              }
+            }
+          }
         }
       }
   return false;
@@ -123,6 +136,29 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
         // downstream load/store is float → gep float, ptr, idx/2
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
           unsigned AS = GEP->getPointerAddressSpace();
+
+          // Float GEP through bfloat/half typed TG pointer: insert bitcast
+          // so Metal v1 typed pointer changes from bfloat* to float*.
+          if (AS == 3 && GEP->getSourceElementType()->isFloatTy() &&
+              GEP->getNumIndices() == 1 &&
+              !isa<BitCastInst>(GEP->getPointerOperand())) {
+            Value *ptr = GEP->getPointerOperand();
+            bool needsBitcast = false;
+            if (auto *pGEP = dyn_cast<GetElementPtrInst>(ptr)) {
+              if (auto *GV = dyn_cast<GlobalVariable>(pGEP->getPointerOperand())) {
+                if (auto *AT = dyn_cast<ArrayType>(GV->getValueType()))
+                  if (AT->getElementType()->isBFloatTy() || AT->getElementType()->isHalfTy())
+                    needsBitcast = true;
+              }
+            }
+            if (needsBitcast) {
+              auto *BC = CastInst::Create(Instruction::BitCast,
+                  ptr, ptr->getType(), "", GEP);
+              GEP->setOperand(0, BC);
+              changed = true;
+            }
+          }
+
           if ((AS == 1 || AS == 3) &&
               GEP->getNumIndices() == 1 &&
               (GEP->getSourceElementType()->isHalfTy() ||
