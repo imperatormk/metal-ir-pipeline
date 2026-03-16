@@ -10,6 +10,7 @@
 //   14d. Preamble: insert gep [M x T], @g, 0, 0 at function entry
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 #include "metal-ir/IRUtil.h"
 #include "llvm/IR/Constants.h"
@@ -22,7 +23,7 @@ namespace metalir {
 
 bool TGGlobalGEPRewritePass::needsRun(Module &M) {
   for (auto &GV : M.globals())
-    if (GV.getAddressSpace() == 3 && isa<ArrayType>(GV.getValueType()))
+    if (GV.getAddressSpace() == AS::Threadgroup && isa<ArrayType>(GV.getValueType()))
       return true;
   return false;
 }
@@ -155,7 +156,7 @@ static bool splitMixedByteGlobals(Module &M,
           M, splitAT, false, GV->getLinkage(),
           UndefValue::get(splitAT),
           GV->getName() + "__off" + Twine(off),
-          GV, GlobalVariable::NotThreadLocal, 3);
+          GV, GlobalVariable::NotThreadLocal, AS::Threadgroup);
       splitGV->setAlignment(GV->getAlign());
       splitMap[off] = splitGV;
     }
@@ -164,7 +165,7 @@ static bool splitMixedByteGlobals(Module &M,
     auto *newGV = new GlobalVariable(
         M, newAT, false, GV->getLinkage(),
         UndefValue::get(newAT), GV->getName().str(),
-        GV, GlobalVariable::NotThreadLocal, 3);
+        GV, GlobalVariable::NotThreadLocal, AS::Threadgroup);
     newGV->setAlignment(GV->getAlign());
 
     SmallVector<GetElementPtrInst *, 8> users;
@@ -289,7 +290,7 @@ static bool mergeByteMMA(Module &M,
   auto *mergedGV = new GlobalVariable(
       M, mergedAT, false, byteGV->getLinkage(),
       UndefValue::get(mergedAT), byteGV->getName().str(),
-      byteGV, GlobalVariable::NotThreadLocal, 3);
+      byteGV, GlobalVariable::NotThreadLocal, AS::Threadgroup);
   mergedGV->setAlignment(byteGV->getAlign());
 
   changed |= rewriteByteGEPs(byteGV, mergedGV, byteAT, mergedAT,
@@ -316,7 +317,7 @@ static bool retypeByteGlobals(Module &M) {
 
   SmallVector<GlobalVariable *, 4> byteGlobals;
   for (auto &GV : M.globals()) {
-    if (GV.getAddressSpace() != 3) continue;
+    if (GV.getAddressSpace() != AS::Threadgroup) continue;
     auto *AT = dyn_cast<ArrayType>(GV.getValueType());
     if (AT && AT->getElementType()->isIntegerTy(8))
       byteGlobals.push_back(&GV);
@@ -392,7 +393,7 @@ static bool retypeByteGlobals(Module &M) {
     auto *newGV = new GlobalVariable(
         M, newAT, GV->isConstant(), GV->getLinkage(),
         UndefValue::get(newAT), GV->getName() + ".typed",
-        GV, GlobalVariable::NotThreadLocal, 3);
+        GV, GlobalVariable::NotThreadLocal, AS::Threadgroup);
     newGV->setAlignment(GV->getAlign());
 
     changed |= rewriteByteGEPs(GV, newGV, oldAT, newAT, elemTy, elemSize, Ctx);
@@ -421,7 +422,7 @@ static bool retypeByteGlobals(Module &M) {
   // Strategy C: split remaining byte globals at constant offsets + retype
   SmallVector<GlobalVariable *, 4> remaining;
   for (auto &GV : M.globals()) {
-    if (GV.getAddressSpace() != 3) continue;
+    if (GV.getAddressSpace() != AS::Threadgroup) continue;
     auto *AT = dyn_cast<ArrayType>(GV.getValueType());
     if (AT && AT->getElementType()->isIntegerTy(8))
       remaining.push_back(&GV);
@@ -460,7 +461,7 @@ static bool retypeByteGlobals(Module &M) {
           M, splitAT, false, GV->getLinkage(),
           UndefValue::get(splitAT),
           GV->getName() + "__off" + Twine(off),
-          GV, GlobalVariable::NotThreadLocal, 3);
+          GV, GlobalVariable::NotThreadLocal, AS::Threadgroup);
       splitGV->setAlignment(GV->getAlign());
       splitMap[off] = splitGV;
     }
@@ -469,7 +470,7 @@ static bool retypeByteGlobals(Module &M) {
     auto *newGV = new GlobalVariable(
         M, newAT, false, GV->getLinkage(),
         UndefValue::get(newAT), GV->getName().str(),
-        GV, GlobalVariable::NotThreadLocal, 3);
+        GV, GlobalVariable::NotThreadLocal, AS::Threadgroup);
     newGV->setAlignment(GV->getAlign());
 
     SmallVector<GetElementPtrInst *, 8> users;
@@ -515,7 +516,7 @@ static bool retypeByteGlobals(Module &M) {
       auto *typedGV = new GlobalVariable(
           M, typedAT, false, splitGV->getLinkage(),
           UndefValue::get(typedAT), splitGV->getName().str() + ".typed",
-          splitGV, GlobalVariable::NotThreadLocal, 3);
+          splitGV, GlobalVariable::NotThreadLocal, AS::Threadgroup);
       typedGV->setAlignment(splitGV->getAlign());
 
       changed |= rewriteByteGEPs(splitGV, typedGV, splitOldAT, typedAT,
@@ -533,7 +534,7 @@ static bool insertPreambleGEPs(Module &M) {
 
   SmallVector<GlobalVariable *, 8> allTGGlobals;
   for (auto &GV : M.globals())
-    if (GV.getAddressSpace() == 3 && isa<ArrayType>(GV.getValueType()))
+    if (GV.getAddressSpace() == AS::Threadgroup && isa<ArrayType>(GV.getValueType()))
       allTGGlobals.push_back(&GV);
 
   for (auto &F : M) {
@@ -544,7 +545,7 @@ static bool insertPreambleGEPs(Module &M) {
       for (auto &I : BB)
         for (auto &Op : I.operands())
           if (auto *GV = dyn_cast<GlobalVariable>(Op))
-            if (GV->getAddressSpace() == 3)
+            if (GV->getAddressSpace() == AS::Threadgroup)
               usedGlobals.insert(GV);
 
     if (usedGlobals.empty()) continue;
@@ -608,7 +609,7 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
   SmallVector<GlobalVariable *, 4> byteGlobals;
   SmallVector<GlobalVariable *, 4> mmaGlobals;
   for (auto &GV : M.globals()) {
-    if (GV.getAddressSpace() != 3) continue;
+    if (GV.getAddressSpace() != AS::Threadgroup) continue;
     auto *AT = dyn_cast<ArrayType>(GV.getValueType());
     if (!AT) continue;
     if (AT->getElementType()->isIntegerTy(8))

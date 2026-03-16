@@ -15,6 +15,7 @@
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/AIRIntrinsics.h"
 #include "metal-ir/IRUtil.h"
+#include "metal-ir/MetalConstraints.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 
@@ -43,7 +44,7 @@ bool TGBarrierInsertPass::needsRun(Module &M) {
     for (auto &BB : F)
       for (auto &I : BB)
         if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == 3)
+          if (SI->getPointerAddressSpace() == AS::Threadgroup)
             return true;
   return false;
 }
@@ -60,10 +61,10 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
     for (auto &BB : F) {
       for (auto &I : BB) {
         if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == 3)
+          if (SI->getPointerAddressSpace() == AS::Threadgroup)
             tgStoreBlocks.insert(&BB);
         if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == 3)
+          if (LI->getPointerAddressSpace() == AS::Threadgroup)
             tgLoadBlocks.insert(&BB);
       }
     }
@@ -85,7 +86,7 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
         continue;
       for (auto it = BB.begin(); it != BB.end(); ++it) {
         auto *SI = dyn_cast<StoreInst>(&*it);
-        if (!SI || SI->getPointerAddressSpace() != 3)
+        if (!SI || SI->getPointerAddressSpace() != AS::Threadgroup)
           continue;
         // Check if already preceded by barrier
         if (it != BB.begin()) {
@@ -130,7 +131,7 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
       Instruction *lastTGLoad = nullptr;
       for (auto &I : BB) {
         if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == 3)
+          if (LI->getPointerAddressSpace() == AS::Threadgroup)
             lastTGLoad = &I;
       }
       if (!lastTGLoad) continue;

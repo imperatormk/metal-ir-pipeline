@@ -11,6 +11,7 @@
 // instead of MetalASM's index-based heuristic.
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Dominators.h"
@@ -30,7 +31,7 @@ bool DeviceLoadsVolatilePass::needsRun(Module &M) {
       bbCount++;
       for (auto &I : BB)
         if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == 1 && !LI->isVolatile())
+          if (LI->getPointerAddressSpace() == AS::Device && !LI->isVolatile())
             hasDeviceLoad = true;
     }
     if (bbCount > 1 && hasDeviceLoad)
@@ -56,7 +57,7 @@ PreservedAnalyses DeviceLoadsVolatilePass::run(Module &M,
       for (auto *BB : L->blocks()) {
         for (auto &I : *BB) {
           if (auto *SI = dyn_cast<StoreInst>(&I)) {
-            if (SI->getPointerAddressSpace() == 1)
+            if (SI->getPointerAddressSpace() == AS::Device)
               storedPtrs.insert(SI->getPointerOperand());
           }
         }
@@ -67,7 +68,7 @@ PreservedAnalyses DeviceLoadsVolatilePass::run(Module &M,
       for (auto *BB : L->blocks()) {
         for (auto &I : *BB) {
           if (auto *LI = dyn_cast<LoadInst>(&I)) {
-            if (LI->getPointerAddressSpace() == 1 && !LI->isVolatile()) {
+            if (LI->getPointerAddressSpace() == AS::Device && !LI->isVolatile()) {
               if (storedPtrs.count(LI->getPointerOperand())) {
                 LI->setVolatile(true);
                 changed = true;

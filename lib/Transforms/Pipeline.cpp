@@ -2,6 +2,7 @@
 // Implemented passes live in their own files.
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 
 #include "llvm/Support/raw_ostream.h"
@@ -40,7 +41,7 @@ bool TGMemoryBudget::fits(unsigned additionalBytes) const {
 TGMemoryBudget TGMemoryAnalysis::run(Module &M, ModuleAnalysisManager &AM) {
   TGMemoryBudget budget;
   for (auto &GV : M.globals())
-    if (GV.getAddressSpace() == 3)
+    if (GV.getAddressSpace() == AS::Threadgroup)
       budget.addGlobal(GV.getName(),
                         M.getDataLayout().getTypeAllocSize(GV.getValueType()));
   return budget;

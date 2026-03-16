@@ -11,6 +11,7 @@
 // ═══════════════════════════════════════════════════════════════════════
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PointeeTypeMap.h"
 
 #include "llvm/IR/InstIterator.h"
@@ -90,7 +91,7 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
       if (!Arg.getType()->isPointerTy() || PTM.has(&Arg))
         continue;
       if (auto *PT = dyn_cast<PointerType>(Arg.getType())) {
-        if (PT->getAddressSpace() == 1)
+        if (PT->getAddressSpace() == AS::Device)
           PTM.set(&Arg, F32);
       }
     }
@@ -114,7 +115,7 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
       if (F.isDeclaration()) continue;
       for (auto &Arg : F.args())
         if (Arg.getType()->isPointerTy() &&
-            Arg.getType()->getPointerAddressSpace() == 1)
+            Arg.getType()->getPointerAddressSpace() == AS::Device)
           PTM.set(&Arg, F32);
     }
 

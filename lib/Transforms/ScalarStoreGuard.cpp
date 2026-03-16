@@ -24,6 +24,7 @@
 
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/AIRIntrinsics.h"
+#include "metal-ir/MetalConstraints.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 
@@ -38,7 +39,7 @@ bool ScalarStoreGuardPass::needsRun(Module &M) {
     for (auto &BB : F) {
       for (auto &I : BB) {
         if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == 1)
+          if (SI->getPointerAddressSpace() == AS::Device)
             hasDeviceWrite = true;
         if (auto *CI = dyn_cast<CallInst>(&I)) {
           if (auto *Callee = CI->getCalledFunction()) {
@@ -78,7 +79,7 @@ PreservedAnalyses ScalarStoreGuardPass::run(Module &M,
     for (auto &BB : F) {
       for (auto &I : BB) {
         if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == 1)
+          if (SI->getPointerAddressSpace() == AS::Device)
             hasDeviceWrite = true;
         if (auto *CI = dyn_cast<CallInst>(&I)) {
           if (auto *Callee = CI->getCalledFunction()) {

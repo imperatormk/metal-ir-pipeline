@@ -1,4 +1,5 @@
 #include "metal-ir/PointeeTypeMap.h"
+#include "metal-ir/MetalConstraints.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -67,7 +68,7 @@ void PointeeTypeMap::collapseDevicePointersToFloat(Module &M) {
     // Check if this is a device pointer (addrspace 1)
     auto *ptrTy = ptr->getType();
     if (auto *PT = dyn_cast<PointerType>(ptrTy)) {
-      if (PT->getAddressSpace() == 1)
+      if (PT->getAddressSpace() == AS::Device)
         ty = F32;
     }
   }

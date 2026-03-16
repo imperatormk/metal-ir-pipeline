@@ -20,6 +20,7 @@
 // This pass queries MMAPresenceAnalysis and skips if no MMA.
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -38,7 +39,7 @@ hasMMA:
     for (auto &BB : F)
       for (auto &I : BB)
         if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == 1 && !LI->getType()->isFloatTy())
+          if (LI->getPointerAddressSpace() == AS::Device && !LI->getType()->isFloatTy())
             return true;
   return false;
 }
@@ -98,7 +99,7 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
     for (auto &BB : F)
       for (auto &I : BB)
         if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == 1 && !LI->getType()->isFloatTy())
+          if (LI->getPointerAddressSpace() == AS::Device && !LI->getType()->isFloatTy())
             loadsToWiden.push_back(LI);
 
   for (auto *LI : loadsToWiden) {
@@ -199,7 +200,7 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
     for (auto &BB : F)
       for (auto &I : BB)
         if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == 1 &&
+          if (SI->getPointerAddressSpace() == AS::Device &&
               !SI->getValueOperand()->getType()->isFloatTy())
             storesToWiden.push_back(SI);
 
@@ -262,7 +263,7 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
             auto *GEP = dyn_cast<GetElementPtrInst>(&*II++);
             if (!GEP) continue;
             if (!GEP->use_empty()) continue;
-            if (GEP->getPointerAddressSpace() != 1) continue;
+            if (GEP->getPointerAddressSpace() != AS::Device) continue;
             auto *srcTy = GEP->getSourceElementType();
             if (!srcTy->isFloatTy()) {
               GEP->eraseFromParent();

@@ -5,6 +5,7 @@
 //    opaque pointer IR but encodes as a real CAST in v1 typed bitcode)
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 #include "metal-ir/IRUtil.h"
 #include "llvm/IR/Constants.h"
@@ -26,13 +27,13 @@ bool NormalizeAllocasPass::needsRun(Module &M) {
           if (BC->getSrcTy() == BC->getDestTy())
             return true;
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-          unsigned AS = GEP->getPointerAddressSpace();
-          if ((AS == 1 || AS == 3) &&
+          unsigned addrSpace = GEP->getPointerAddressSpace();
+          if ((addrSpace == AS::Device || addrSpace == AS::Threadgroup) &&
               (GEP->getSourceElementType()->isHalfTy() ||
                GEP->getSourceElementType()->isBFloatTy()))
             return true;
           // float GEP through bfloat/half typed TG pointer
-          if (AS == 3 && GEP->getSourceElementType()->isFloatTy() &&
+          if (addrSpace == AS::Threadgroup && GEP->getSourceElementType()->isFloatTy() &&
               GEP->getNumIndices() == 1 && !isa<BitCastInst>(GEP->getPointerOperand())) {
             // Check if pointer traces back to a bfloat/half TG global
             Value *ptr = GEP->getPointerOperand();
@@ -94,14 +95,14 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
         // Metal v1 typed pointers require explicit bitcast to change type.
         if (auto *SI = dyn_cast<StoreInst>(&I)) {
           Value *ptr = SI->getPointerOperand();
-          unsigned AS = ptr->getType()->getPointerAddressSpace();
-          if ((AS == 1 || AS == 3) && !isa<BitCastInst>(ptr)) {
+          unsigned addrSpace = ptr->getType()->getPointerAddressSpace();
+          if ((addrSpace == AS::Device || addrSpace == AS::Threadgroup) && !isa<BitCastInst>(ptr)) {
             // Check if GEP source type differs from store value type
             Type *valTy = SI->getValueOperand()->getType();
             bool needsBitcast = false;
-            if (AS == 1 && !valTy->isFloatTy())
+            if (addrSpace == AS::Device && !valTy->isFloatTy())
               needsBitcast = true;
-            if (AS == 3) {
+            if (addrSpace == AS::Threadgroup) {
               if (auto *GEP = dyn_cast<GetElementPtrInst>(ptr))
                 if (GEP->getSourceElementType() != valTy)
                   needsBitcast = true;
@@ -120,7 +121,7 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
         // GEP source type differs from the loaded value type.
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
           Value *ptr = LI->getPointerOperand();
-          if (ptr->getType()->getPointerAddressSpace() == 3 &&
+          if (ptr->getType()->getPointerAddressSpace() == AS::Threadgroup &&
               !isa<BitCastInst>(ptr)) {
             if (auto *GEP = dyn_cast<GetElementPtrInst>(ptr))
               if (GEP->getSourceElementType() != LI->getType()) {
@@ -136,11 +137,11 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
         // Fix GEP source type mismatch: gep half, ptr, idx where
         // downstream load/store is float → gep float, ptr, idx/2
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-          unsigned AS = GEP->getPointerAddressSpace();
+          unsigned addrSpace = GEP->getPointerAddressSpace();
 
           // Float GEP through bfloat/half typed TG pointer: insert bitcast
           // so Metal v1 typed pointer changes from bfloat* to float*.
-          if (AS == 3 && GEP->getSourceElementType()->isFloatTy() &&
+          if (addrSpace == AS::Threadgroup && GEP->getSourceElementType()->isFloatTy() &&
               GEP->getNumIndices() == 1 &&
               !isa<BitCastInst>(GEP->getPointerOperand())) {
             Value *ptr = GEP->getPointerOperand();
@@ -160,7 +161,7 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
             }
           }
 
-          if ((AS == 1 || AS == 3) &&
+          if ((addrSpace == AS::Device || addrSpace == AS::Threadgroup) &&
               GEP->getNumIndices() == 1 &&
               (GEP->getSourceElementType()->isHalfTy() ||
                GEP->getSourceElementType()->isBFloatTy())) {

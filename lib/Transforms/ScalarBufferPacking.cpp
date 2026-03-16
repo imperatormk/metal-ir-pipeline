@@ -11,6 +11,7 @@
 // Must run BEFORE AIRSystemValues (which generates !air.kernel metadata).
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -51,7 +52,7 @@ bool ScalarBufferPackingPass::needsRun(Module &M) {
       Type *T = Arg.getType();
       if (!T->isPointerTy() && !T->isVectorTy())
         return true;
-      if (T->isPointerTy() && T->getPointerAddressSpace() == 2)
+      if (T->isPointerTy() && T->getPointerAddressSpace() == AS::Constant)
         return true;
     }
   }
@@ -130,14 +131,14 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
       unsigned i = 0;
       while (i < F.arg_size()) {
         Type *T = F.getArg(i)->getType();
-        bool isDevicePtr = T->isPointerTy() && T->getPointerAddressSpace() == 1;
+        bool isDevicePtr = T->isPointerTy() && T->getPointerAddressSpace() == AS::Device;
         if (isDevicePtr) {
           // Count consecutive AS(2) params after this device ptr
           unsigned groupStart = i + 1;
           unsigned j = groupStart;
           while (j < F.arg_size()) {
             Type *Tj = F.getArg(j)->getType();
-            if (!Tj->isPointerTy() || Tj->getPointerAddressSpace() != 2)
+            if (!Tj->isPointerTy() || Tj->getPointerAddressSpace() != AS::Constant)
               break;
             j++;
           }
@@ -180,7 +181,7 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
       if (sysValParams.count(i)) continue;
       Type *T = F.getArg(i)->getType();
       if (T->isPointerTy()) {
-        if (T->getPointerAddressSpace() == 2) {
+        if (T->getPointerAddressSpace() == AS::Constant) {
           Type *loadTy = inferConstPtrLoadType(F, i);
           // If inferred type is a pointer, use i64 (pointers are 64-bit)
           if (loadTy && loadTy->isPointerTy())
