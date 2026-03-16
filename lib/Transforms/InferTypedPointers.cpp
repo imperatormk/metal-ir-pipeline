@@ -35,13 +35,7 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
   // We refine it here with Metal-specific rules.
   auto &PTM = AM.getResult<PointeeTypeAnalysis>(M);
 
-  bool hasMMA = false;
-  for (auto &F : M) {
-    if (F.getName().contains("multiply_accumulate")) {
-      hasMMA = true;
-      break;
-    }
-  }
+  bool hasMMA = AM.getResult<MMAPresenceAnalysis>(M).hasMMA;
 
   // Phase 0: Map function pointers.
   // In LLVM opaque ptr world, all functions share `ptr` type.

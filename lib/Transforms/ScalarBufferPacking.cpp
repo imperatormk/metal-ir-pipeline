@@ -75,10 +75,7 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
     if (!F.isDeclaration() && !calledFns.count(&F))
       funcs.push_back(&F);
 
-  bool hasMMA = false;
-  for (auto &F : M)
-    if (F.getName().starts_with("air.simdgroup_matrix_8x8_"))
-      hasMMA = true;
+  bool hasMMA = AM.getResult<MMAPresenceAnalysis>(M).hasMMA;
 
   for (auto *FPtr : funcs) {
     Function &F = *FPtr;
