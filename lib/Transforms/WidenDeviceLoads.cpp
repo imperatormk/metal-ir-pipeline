@@ -20,7 +20,7 @@
 // This pass queries MMAPresenceAnalysis and skips if no MMA.
 
 #include "metal-ir/Pipeline.h"
-#include "metal-ir/MetalConstraints.h"
+#include "metal-ir/IRUtil.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -38,9 +38,8 @@ hasMMA:
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB)
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == AS::Device && !LI->getType()->isFloatTy())
-            return true;
+        if (isDeviceLoad(&I) && !cast<LoadInst>(&I)->getType()->isFloatTy())
+          return true;
   return false;
 }
 
@@ -98,9 +97,8 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB)
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == AS::Device && !LI->getType()->isFloatTy())
-            loadsToWiden.push_back(LI);
+        if (isDeviceLoad(&I) && !cast<LoadInst>(&I)->getType()->isFloatTy())
+          loadsToWiden.push_back(cast<LoadInst>(&I));
 
   for (auto *LI : loadsToWiden) {
     Type *origTy = LI->getType();
@@ -199,10 +197,9 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB)
-        if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == AS::Device &&
-              !SI->getValueOperand()->getType()->isFloatTy())
-            storesToWiden.push_back(SI);
+        if (isDeviceStore(&I) &&
+            !cast<StoreInst>(&I)->getValueOperand()->getType()->isFloatTy())
+          storesToWiden.push_back(cast<StoreInst>(&I));
 
   for (auto *SI : storesToWiden) {
     Value *val = SI->getValueOperand();
