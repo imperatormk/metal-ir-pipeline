@@ -21,6 +21,7 @@ Type *PointeeTypeMap::inferFromUsage(Value *ptr) {
   // Prioritize load/store types over GEP source types.
   // Recurse through GEP chains to find the ultimate store/load type.
   Type *gepType = nullptr;
+  Type *atomicType = nullptr;
   for (auto *U : ptr->users()) {
     if (auto *LI = dyn_cast<LoadInst>(U))
       return LI->getType();
@@ -35,8 +36,23 @@ Type *PointeeTypeMap::inferFromUsage(Value *ptr) {
       if (!gepType)
         gepType = GEP->getSourceElementType();
     }
+    // Infer from atomic intrinsic calls: air.atomic.*.i32 → i32,
+    // air.atomic.*.f32 → float. This ensures device pointers used
+    // only in atomics get the correct typed pointer (not default float*).
+    if (auto *CI = dyn_cast<CallInst>(U)) {
+      if (auto *Callee = CI->getCalledFunction()) {
+        StringRef name = Callee->getName();
+        if (name.starts_with("air.atomic.") && !atomicType) {
+          if (name.ends_with(".i32"))
+            atomicType = Type::getInt32Ty(ptr->getContext());
+          else if (name.ends_with(".f32"))
+            atomicType = Type::getFloatTy(ptr->getContext());
+        }
+      }
+    }
   }
-  return gepType;
+  if (gepType) return gepType;
+  return atomicType;
 }
 
 // ── Collapse device pointers to float* ───────────────────────────────────

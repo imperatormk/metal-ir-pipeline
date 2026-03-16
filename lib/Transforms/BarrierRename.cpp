@@ -50,28 +50,12 @@ PreservedAnalyses BarrierRenamePass::run(Module &M,
       OldBarrier->eraseFromParent();
   }
 
-  // Also fix air.wg.barrier calls with wrong scope (1 → 2).
-  // Triton MLIR sometimes emits air.wg.barrier(1, 1) directly;
-  // Apple's Metal compiler always uses (2, 1) for threadgroup barriers.
-  auto *Barrier = M.getFunction(air::kBarrier);
-  if (Barrier) {
-    for (auto &F : M) {
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          auto *CI = dyn_cast<CallInst>(&I);
-          if (!CI || CI->getCalledFunction() != Barrier)
-            continue;
-          if (CI->arg_size() >= 1) {
-            if (auto *C0 = dyn_cast<ConstantInt>(CI->getArgOperand(0)))
-              if (C0->getZExtValue() == 1) {
-                CI->setArgOperand(0, ConstantInt::get(C0->getType(), 2));
-                changed = true;
-              }
-          }
-        }
-      }
-    }
-  }
+  // NOTE: Do NOT convert air.wg.barrier(1, 1) to (2, 1).
+  // In Metal AIR: 1 = mem_device, 2 = mem_threadgroup, 3 = both.
+  // Triton MLIR's air.wg.barrier(1, 1) is correct for device memory
+  // barriers (needed for inter-threadgroup synchronization like CAS locks).
+  // Converting to (2, 1) would change it to threadgroup-only, which is
+  // wrong for kernels that need device memory ordering.
 
   return changed ? changedNonCFG() : PreservedAnalyses::all();
 }

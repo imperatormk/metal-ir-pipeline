@@ -272,7 +272,25 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
     }
     // Infer pointee for this specific param
     Type *pointee = nullptr;
-    if (F && !F->isDeclaration() && i < F->arg_size())
+
+    // For atomic intrinsics, the device pointer param must match the
+    // atomic type (i32 or f32) — NOT the kernel buffer's default pointee.
+    // E.g., air.atomic.global.cmpxchg.weak.i32 needs i32*, not float*.
+    if (F && F->isDeclaration()) {
+      StringRef name = F->getName();
+      if (name.starts_with("air.atomic.")) {
+        unsigned AS = cast<PointerType>(PT)->getAddressSpace();
+        if (AS == 1 || AS == 3) {
+          // Determine pointee from intrinsic name suffix
+          if (name.ends_with(".i32"))
+            pointee = Type::getInt32Ty(F->getContext());
+          else if (name.ends_with(".f32"))
+            pointee = Type::getFloatTy(F->getContext());
+        }
+      }
+    }
+
+    if (!pointee && F && !F->isDeclaration() && i < F->arg_size())
       pointee = pointeeTypeForValue(F->getArg(i));
     // For declarations, infer from call site arguments
     if (!pointee && F && F->isDeclaration()) {
