@@ -12,6 +12,7 @@
 // Only when MMA present (without MMA, cvt and dot overlap).
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -29,7 +30,7 @@ bool TGGlobalCoalescePass::needsRun(Module &M) {
       hasMMA = true;
   if (!hasMMA) return false;
   for (auto &GV : M.globals()) {
-    if (GV.getAddressSpace() != 3) continue;
+    if (GV.getAddressSpace() != AS::Threadgroup) continue;
     if (GV.getName().starts_with("__tg_cvt_")) hasCvt = true;
     if (GV.getName().starts_with("__tg_dot_")) hasDot = true;
   }
@@ -48,7 +49,7 @@ PreservedAnalyses TGGlobalCoalescePass::run(Module &M,
   SmallVector<GlobalVariable *, 4> dotAbGlobals;
 
   for (auto &GV : M.globals()) {
-    if (GV.getAddressSpace() != 3) continue;
+    if (GV.getAddressSpace() != AS::Threadgroup) continue;
     auto *AT = dyn_cast<ArrayType>(GV.getValueType());
     if (!AT || AT->getNumElements() <= 64) continue;
 
