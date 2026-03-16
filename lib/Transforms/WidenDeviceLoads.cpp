@@ -66,7 +66,17 @@ static bool decomposeGEP(GetElementPtrInst *GEP, Value *&base,
     if (baseGEP->getSourceElementType() != elemTy) break;
     // Combine: total index = baseGEP.index + index
     IRBuilder<> B(GEP);
-    index = B.CreateAdd(baseGEP->getOperand(1), index, "idx_flat");
+    Value *baseIdx = baseGEP->getOperand(1);
+    // Widen to matching types if needed (e.g. i32 + i64)
+    if (baseIdx->getType() != index->getType()) {
+      unsigned bw1 = baseIdx->getType()->getIntegerBitWidth();
+      unsigned bw2 = index->getType()->getIntegerBitWidth();
+      if (bw1 < bw2)
+        baseIdx = B.CreateSExt(baseIdx, index->getType());
+      else
+        index = B.CreateSExt(index, baseIdx->getType());
+    }
+    index = B.CreateAdd(baseIdx, index, "idx_flat");
     base = baseGEP->getPointerOperand();
   }
 

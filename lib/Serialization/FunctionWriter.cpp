@@ -105,7 +105,12 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         W.EmitRecord(bitc::FUNC_CODE_INST_CAST, V);
       } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
         V.push_back(getID(LI->getPointerOperand()));
-        V.push_back(E.typeIdx(LI->getType()));
+        // For loads producing pointer types, use per-value pointee
+        // (same rationale as PHI — avoid single-pointee-per-AS mismatch)
+        if (LI->getType()->isPointerTy())
+          V.push_back(E.ptrTypeIdxForValue(LI));
+        else
+          V.push_back(E.typeIdx(LI->getType()));
         V.push_back(Log2_32(LI->getAlign().value()) + 1);
         V.push_back(LI->isVolatile() ? 1 : 0);
         W.EmitRecord(bitc::FUNC_CODE_INST_LOAD, V);
@@ -176,16 +181,25 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         V.push_back(getID(Sel->getTrueValue()));
         V.push_back(getID(Sel->getFalseValue()));
         V.push_back(getID(Sel->getCondition()));
-        W.EmitRecord(Sel->getType()->isVectorTy()
-                         ? bitc::FUNC_CODE_INST_VSELECT
-                         : bitc::FUNC_CODE_INST_SELECT, V);
+        // Use SELECT (code 5) for scalar selects — Metal GPU JIT uses this
+        // encoding (3 operands: trueVal, falseVal, cond). VSELECT (code 29)
+        // has a different format (5 operands) and causes materializeAll.
+        W.EmitRecord(bitc::FUNC_CODE_INST_SELECT, V);
       } else if (auto *Cmp = dyn_cast<CmpInst>(&I)) {
         V.push_back(getID(Cmp->getOperand(0)));
         V.push_back(getID(Cmp->getOperand(1)));
         V.push_back(Cmp->getPredicate());
         W.EmitRecord(bitc::FUNC_CODE_INST_CMP2, V);
       } else if (auto *PN = dyn_cast<PHINode>(&I)) {
-        V.push_back(E.typeIdx(PN->getType()));
+        // For pointer-typed PHIs, use per-value pointee type from PTM
+        // to avoid mismatch when different AS1 params have different
+        // pointee types (e.g., half* vs float*). The generic typeIdx()
+        // returns a single pointee per address space, which is wrong
+        // when the PHI's incoming values have a different pointee.
+        if (PN->getType()->isPointerTy())
+          V.push_back(E.ptrTypeIdxForValue(PN));
+        else
+          V.push_back(E.typeIdx(PN->getType()));
         for (unsigned i = 0; i < PN->getNumIncomingValues(); i++) {
           // PHI uses signed relative IDs (back-edge values have higher absID
           // than current, producing negative relative ID = forward reference)

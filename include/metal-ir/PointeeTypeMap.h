@@ -62,6 +62,11 @@ public:
     return map.count(ptr);
   }
 
+  // Remove a pointer's entry (used when erasing instructions).
+  void remove(llvm::Value *ptr) {
+    map.erase(ptr);
+  }
+
   // Iterate all entries.
   auto begin() const { return map.begin(); }
   auto end() const { return map.end(); }

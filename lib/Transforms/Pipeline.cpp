@@ -47,50 +47,60 @@ TGMemoryBudget TGMemoryAnalysis::run(Module &M, ModuleAnalysisManager &AM) {
 // ── Pipeline Builder ─────────────────────────────────────────────────────
 
 void buildMetalIRPipeline(ModulePassManager &MPM) {
+  int stopAfter = -1;
+  if (auto *env = getenv("METALIR_STOP_AFTER"))
+    stopAfter = atoi(env);
+  int passNum = 0;
+  auto maybeAdd = [&](auto pass) {
+    if (stopAfter < 0 || passNum < stopAfter)
+      MPM.addPass(std::move(pass));
+    passNum++;
+  };
+
   // Phase 1: Structural transforms
-  MPM.addPass(InlineNonKernelFunctionsPass());
-  MPM.addPass(DecomposeStructPhisPass());
-  MPM.addPass(PtrPhiToI64Pass());
+  maybeAdd(InlineNonKernelFunctionsPass());
+  maybeAdd(DecomposeStructPhisPass());
+  maybeAdd(PtrPhiToI64Pass());
 
   // Phase 2: Barrier handling
-  MPM.addPass(BarrierRenamePass());
-  MPM.addPass(TGBarrierInsertPass());
+  maybeAdd(BarrierRenamePass());
+  maybeAdd(TGBarrierInsertPass());
 
   // Phase 3: Instruction lowering (independent, any order)
-  MPM.addPass(NaNMinMaxPass());
-  MPM.addPass(LowerFNegPass());
-  MPM.addPass(BitcastZeroInitPass());
-  MPM.addPass(LLVMToAIRIntrinsicsPass());
-  MPM.addPass(LowerIntMinMaxPass());
-  MPM.addPass(SplitI64ShufflePass());
-  MPM.addPass(LowerAtomicRMWPass());
+  maybeAdd(NaNMinMaxPass());
+  maybeAdd(LowerFNegPass());
+  maybeAdd(BitcastZeroInitPass());
+  maybeAdd(LLVMToAIRIntrinsicsPass());
+  maybeAdd(LowerIntMinMaxPass());
+  maybeAdd(SplitI64ShufflePass());
+  maybeAdd(LowerAtomicRMWPass());
 
   // Phase 4: TG memory management (strict order)
-  MPM.addPass(TGGlobalDeadElimPass());
-  MPM.addPass(TGGlobalCoalescePass());
-  MPM.addPass(TGGlobalGEPRewritePass());
+  maybeAdd(TGGlobalDeadElimPass());
+  maybeAdd(TGGlobalCoalescePass());
+  maybeAdd(TGGlobalGEPRewritePass());
 
   // Phase 5: Type system
-  MPM.addPass(InferTypedPointersPass());
-  MPM.addPass(MMATypedPointersPass());
+  maybeAdd(InferTypedPointersPass());
+  maybeAdd(MMATypedPointersPass());
 
   // Phase 6: Kernel ABI
-  MPM.addPass(ScalarBufferPackingPass());
-  MPM.addPass(ScalarStoreGuardPass());
-  MPM.addPass(AIRSystemValuesPass());
+  maybeAdd(ScalarBufferPackingPass());
+  maybeAdd(ScalarStoreGuardPass());
+  maybeAdd(AIRSystemValuesPass());
 
   // Phase 7: Pre-serialization normalization (part 1)
-  MPM.addPass(NormalizeI1PointersPass());
+  maybeAdd(NormalizeI1PointersPass());
 
   // Phase 8: Device memory fixups
-  MPM.addPass(DeviceLoadsVolatilePass());
-  MPM.addPass(WidenDeviceLoadsPass());
+  maybeAdd(DeviceLoadsVolatilePass());
+  maybeAdd(WidenDeviceLoadsPass());
 
   // Phase 9: Cast decomposition (after WidenDeviceLoads so trunc→sext folds)
-  MPM.addPass(BFloat16CastDecomposePass());
+  maybeAdd(BFloat16CastDecomposePass());
 
   // Phase 10: Pre-serialization normalization (part 2, after widening)
-  MPM.addPass(NormalizeAllocasPass());
+  maybeAdd(NormalizeAllocasPass());
 }
 
 // ── Stubs — passes not yet ported ────────────────────────────────────────

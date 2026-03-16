@@ -75,26 +75,11 @@ void *metalir_compile(const char *llText, uint64_t *outLen,
   metalir::buildMetalIRPipeline(MPM);
   MPM.run(*M, MAM);
 
-  // Ensure target triple + datalayout (Triton MLIR→LLVM often omits them).
-  // Query actual macOS version for the triple.
-  {
-    unsigned maj = 26, min = 0, pat = 0;
-#if __has_include(<sys/sysctl.h>)
-    char buf[64] = {};
-    size_t len = sizeof(buf);
-    if (sysctlbyname("kern.osproductversion", buf, &len, nullptr, 0) == 0)
-      sscanf(buf, "%u.%u.%u", &maj, &min, &pat);
-#endif
-    char triple[128];
-    snprintf(triple, sizeof(triple), "air64_v28-apple-macosx%u.%u.%u", maj, min, pat);
-    M->setTargetTriple(Triple(triple));
-  }
-  // Always set the full AIR datalayout (Triton MLIR may emit a truncated one)
-  M->setDataLayout("e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64"
-                     "-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32"
-                     "-v48:64:64-v64:64:64-v96:128:128-v128:128:128"
-                     "-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024"
-                     "-n8:16:32");
+  // Don't set target triple or datalayout on the module — the metallib header
+  // has its own platform bytes, and these in the bitcode can cause
+  // materializeAll failures for complex kernels on some GPU JIT versions.
+  // Skip datalayout too:
+  // M->setDataLayout(...);
 
   // Debug: dump transformed IR if METALIR_DUMP_IR is set
   if (getenv("METALIR_DUMP_IR")) {
