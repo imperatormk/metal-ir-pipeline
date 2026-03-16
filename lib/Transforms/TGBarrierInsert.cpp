@@ -14,16 +14,12 @@
 
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/AIRIntrinsics.h"
+#include "metal-ir/IRUtil.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 
 using namespace llvm;
 namespace metalir {
-
-static bool isTGPtr(Value *V) {
-  return V->getType()->isPointerTy() &&
-         V->getType()->getPointerAddressSpace() == 3;
-}
 
 static bool isBarrierCall(Instruction *I) {
   if (auto *CI = dyn_cast<CallInst>(I))

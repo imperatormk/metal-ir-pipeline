@@ -1,0 +1,11 @@
+PASS: llvm-to-air-intrinsics
+CHECK: air.fast_sin.f32
+CHECK: air.fast_cos.f32
+CHECK: air.fast_sqrt.f32
+CHECK: air.fast_exp.f32
+CHECK: air.fast_log.f32
+CHECK-NOT: llvm.sin
+CHECK-NOT: llvm.cos
+CHECK-NOT: llvm.sqrt
+CHECK-NOT: llvm.exp
+CHECK-NOT: llvm.log

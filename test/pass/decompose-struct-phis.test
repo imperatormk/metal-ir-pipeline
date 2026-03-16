@@ -1,0 +1,6 @@
+PASS: decompose-struct-phis
+CHECK: phi float
+CHECK: phi i32
+CHECK-NOT: phi { float, float }
+CHECK-NOT: insertvalue
+CHECK-NOT: extractvalue

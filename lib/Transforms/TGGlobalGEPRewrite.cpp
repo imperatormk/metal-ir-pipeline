@@ -12,6 +12,7 @@
 
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/PassUtil.h"
+#include "metal-ir/IRUtil.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -25,57 +26,6 @@ bool TGGlobalGEPRewritePass::needsRun(Module &M) {
     if (GV.getAddressSpace() == 3 && isa<ArrayType>(GV.getValueType()))
       return true;
   return false;
-}
-
-/// Walk users transitively to find actual store/load element type.
-static Type *inferTGElementType(Value *V) {
-  for (auto *U : V->users()) {
-    if (auto *SI = dyn_cast<StoreInst>(U))
-      if (SI->getPointerOperand() == V)
-        return SI->getValueOperand()->getType();
-    if (auto *LI = dyn_cast<LoadInst>(U))
-      return LI->getType();
-    if (isa<GetElementPtrInst>(U) || isa<GEPOperator>(U) || isa<BitCastInst>(U))
-      if (Type *T = inferTGElementType(U))
-        return T;
-  }
-  return nullptr;
-}
-
-/// Expand all ConstantExpr users of a global into instructions.
-static void expandConstantExprUsers(GlobalVariable *GV) {
-  SmallVector<std::pair<ConstantExpr *, Instruction *>, 4> toExpand;
-  for (auto *U : GV->users()) {
-    auto *CE = dyn_cast<ConstantExpr>(U);
-    if (!CE) continue;
-    for (auto *CEU : CE->users())
-      if (auto *I = dyn_cast<Instruction>(CEU))
-        toExpand.push_back({CE, I});
-  }
-  for (auto &[CE, I] : toExpand) {
-    auto *Inst = CE->getAsInstruction();
-    Inst->insertBefore(I);
-    I->replaceUsesOfWith(CE, Inst);
-  }
-  SmallVector<ConstantExpr *, 4> dead;
-  for (auto *U : GV->users())
-    if (auto *CE = dyn_cast<ConstantExpr>(U))
-      if (CE->use_empty())
-        dead.push_back(CE);
-  for (auto *CE : dead)
-    CE->destroyConstant();
-}
-
-/// Recursively collect all i8-source GEPs in the user chain of V.
-static void collectI8Geps(Value *V, SmallVectorImpl<GetElementPtrInst *> &out) {
-  for (auto *U : V->users()) {
-    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-      if (GEP->getSourceElementType()->isIntegerTy(8))
-        out.push_back(GEP);
-      else
-        collectI8Geps(GEP, out);
-    }
-  }
 }
 
 PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
@@ -216,7 +166,7 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
   // merge into one global. They alias the same memory (barrier-separated).
   // Only when exactly 1 MMA global remains after coalesce.
   // Before merging, scalarize <1 x T> on the byte global so
-  // inferTGElementType returns scalar float (enabling the merge).
+  // inferElementType returns scalar float (enabling the merge).
   // Check for wide vector stores on byte global
   bool hasWideVec = false;
   if (!byteGlobals.empty() && mmaGlobals.size() == 1) {
@@ -309,7 +259,7 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
       auto *bAT = cast<ArrayType>(byteGlobals[i]->getValueType());
       uint64_t bBytes = bAT->getNumElements();
       // Prefer type-compatible merge (inferred type matches MMA element)
-      Type *inferred = inferTGElementType(byteGlobals[i]);
+      Type *inferred = inferElementType(byteGlobals[i]);
       bool typeMatch = inferred && (inferred == mmaElemTy ||
           (inferred->isIntegerTy(32) && mmaElemTy->isFloatTy()) ||
           (inferred->isFloatTy() && mmaElemTy->isIntegerTy(32)));
@@ -424,7 +374,7 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
   for (auto *GV : byteGlobals) {
     expandConstantExprUsers(GV);
 
-    Type *storeTy = inferTGElementType(GV);
+    Type *storeTy = inferElementType(GV);
     if (!storeTy) continue;
 
     // Check ALL store/load types through the global. If there's a mix
@@ -541,7 +491,7 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
     }
 
     // Re-infer storeTy after scalarization (<1 x float> → float)
-    storeTy = inferTGElementType(GV);
+    storeTy = inferElementType(GV);
     if (!storeTy) continue;
 
     auto *oldAT = cast<ArrayType>(GV->getValueType());
@@ -751,7 +701,7 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
     for (auto &kv : splitMap)
       toRetype.push_back(kv.second);
     for (auto *splitGV : toRetype) {
-      Type *elemTy = inferTGElementType(splitGV);
+      Type *elemTy = inferElementType(splitGV);
       if (!elemTy) continue;
       if (elemTy->isBFloatTy()) elemTy = Type::getHalfTy(Ctx);
       unsigned eSize = DL.getTypeAllocSize(elemTy);

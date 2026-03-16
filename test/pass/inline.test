@@ -1,0 +1,4 @@
+PASS: inline
+CHECK: fadd float
+CHECK-NOT: call float @helper
+CHECK-NOT: define internal float @helper

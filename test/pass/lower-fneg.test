@@ -1,0 +1,3 @@
+PASS: lower-fneg
+CHECK: fsub float -0.000000e+00
+CHECK-NOT: fneg float
