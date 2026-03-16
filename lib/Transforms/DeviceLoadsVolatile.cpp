@@ -12,6 +12,7 @@
 
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/IRUtil.h"
+#include "metal-ir/KernelProfile.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Dominators.h"
@@ -40,9 +41,15 @@ bool DeviceLoadsVolatilePass::needsRun(Module &M) {
 PreservedAnalyses DeviceLoadsVolatilePass::run(Module &M,
                                                 ModuleAnalysisManager &MAM) {
   bool changed = false;
+  auto &profiles = MAM.getResult<KernelProfileAnalysis>(M);
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
+
+    // Early exit: no device store+load pattern means no volatile marking needed
+    auto it = profiles.find(&F);
+    if (it != profiles.end() && !it->second.hasDeviceStoreLoadPattern())
+      continue;
 
     DominatorTree DT(F);
     LoopInfo LI(DT);

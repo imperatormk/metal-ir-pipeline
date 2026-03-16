@@ -15,6 +15,7 @@
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/AIRIntrinsics.h"
 #include "metal-ir/IRUtil.h"
+#include "metal-ir/KernelProfile.h"
 #include "metal-ir/MetalConstraints.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -50,9 +51,15 @@ bool TGBarrierInsertPass::needsRun(Module &M) {
 PreservedAnalyses TGBarrierInsertPass::run(Module &M,
                                             ModuleAnalysisManager &AM) {
   bool changed = false;
+  auto &profiles = AM.getResult<KernelProfileAnalysis>(M);
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
+
+    // Early exit: KernelProfile says no TG stores in this function
+    auto it = profiles.find(&F);
+    if (it != profiles.end() && !it->second.needsTGBarriers())
+      continue;
 
     // Collect blocks with TG stores and TG loads
     SmallPtrSet<BasicBlock *, 8> tgStoreBlocks, tgLoadBlocks;

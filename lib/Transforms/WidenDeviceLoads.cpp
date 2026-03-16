@@ -21,6 +21,7 @@
 
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/IRUtil.h"
+#include "metal-ir/KernelProfile.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -91,14 +92,21 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
 
   bool changed = false;
   Type *F32 = Type::getFloatTy(M.getContext());
+  auto &profiles = MAM.getResult<KernelProfileAnalysis>(M);
 
   // Collect non-float device loads
   SmallVector<LoadInst *, 16> loadsToWiden;
-  for (auto &F : M)
+  for (auto &F : M) {
+    // Early exit: skip functions without non-float device loads
+    auto it = profiles.find(&F);
+    if (it != profiles.end() && !it->second.needsDeviceLoadWidening()
+        && !it->second.hasNonFloatDeviceStore)
+      continue;
     for (auto &BB : F)
       for (auto &I : BB)
         if (isDeviceLoad(&I) && !cast<LoadInst>(&I)->getType()->isFloatTy())
           loadsToWiden.push_back(cast<LoadInst>(&I));
+  }
 
   for (auto *LI : loadsToWiden) {
     Type *origTy = LI->getType();
@@ -194,12 +202,16 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
 
   // Widen non-float device stores (reverse of load widening)
   SmallVector<StoreInst *, 16> storesToWiden;
-  for (auto &F : M)
+  for (auto &F : M) {
+    auto it = profiles.find(&F);
+    if (it != profiles.end() && !it->second.hasNonFloatDeviceStore)
+      continue;
     for (auto &BB : F)
       for (auto &I : BB)
         if (isDeviceStore(&I) &&
             !cast<StoreInst>(&I)->getValueOperand()->getType()->isFloatTy())
           storesToWiden.push_back(cast<StoreInst>(&I));
+  }
 
   for (auto *SI : storesToWiden) {
     Value *val = SI->getValueOperand();

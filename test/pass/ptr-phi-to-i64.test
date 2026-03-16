@@ -1,0 +1,3 @@
+PASS: ptr-phi-to-i64
+CHECK: phi ptr addrspace(1)
+CHECK-NOT: ptrtoint

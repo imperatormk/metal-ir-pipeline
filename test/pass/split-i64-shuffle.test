@@ -1,0 +1,3 @@
+PASS: split-i64-shuffle
+CHECK: air.simd_shuffle.i32
+CHECK-NOT: air.simd_shuffle.i64
