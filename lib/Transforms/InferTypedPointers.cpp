@@ -36,7 +36,8 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
   // We refine it here with Metal-specific rules.
   auto &PTM = AM.getResult<PointeeTypeAnalysis>(M);
 
-  bool hasMMA = AM.getResult<MMAPresenceAnalysis>(M).hasMMA;
+  MetalConstraints constraints;
+  constraints.hasMMA = AM.getResult<MMAPresenceAnalysis>(M).hasMMA;
   Type *F32 = Type::getFloatTy(M.getContext());
 
   // Phase 0: Map function pointers.
@@ -82,7 +83,7 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
   PTM.remapI1ToI8(M);
 
   // Phase 3: If MMA present, all device pointers → float*
-  if (hasMMA)
+  if (constraints.hasMMA)
     PTM.collapseDevicePointersToFloat(M);
 
   // Phase 4: Default unresolved device pointers to float*
@@ -98,7 +99,7 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
   }
 
   // Phase 5: MMA-specific overrides (formerly MMATypedPointersPass)
-  if (hasMMA) {
+  if (constraints.hasMMA) {
     // MMA load/store declaration params → float*
     for (auto &F : M) {
       if (!F.isDeclaration()) continue;

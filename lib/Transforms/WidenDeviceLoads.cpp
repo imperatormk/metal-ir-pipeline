@@ -86,9 +86,10 @@ static bool decomposeGEP(GetElementPtrInst *GEP, Value *&base,
 
 PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
                                              ModuleAnalysisManager &MAM) {
-  // Check MMA presence
-  auto &MMA = MAM.getResult<MMAPresenceAnalysis>(M);
-  if (!MMA.hasMMA) return PreservedAnalyses::all();
+  // Query constraints: only widen when MMA present
+  MetalConstraints constraints;
+  constraints.hasMMA = MAM.getResult<MMAPresenceAnalysis>(M).hasMMA;
+  if (!constraints.widenDeviceLoadsToFloat()) return PreservedAnalyses::all();
 
   bool changed = false;
   Type *F32 = Type::getFloatTy(M.getContext());

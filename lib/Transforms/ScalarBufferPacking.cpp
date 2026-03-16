@@ -76,8 +76,6 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
     if (!F.isDeclaration() && !calledFns.count(&F))
       funcs.push_back(&F);
 
-  bool hasMMA = AM.getResult<MMAPresenceAnalysis>(M).hasMMA;
-
   for (auto *FPtr : funcs) {
     Function &F = *FPtr;
 
