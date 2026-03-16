@@ -224,8 +224,8 @@ PreservedAnalyses AIRSystemValuesPass::run(Module &M,
         if (!ParamTy->isPointerTy())
           continue;
 
-        unsigned AS = cast<PointerType>(ParamTy)->getAddressSpace();
-        if (AS != 1 && AS != 2)
+        unsigned addrSpace = cast<PointerType>(ParamTy)->getAddressSpace();
+        if (addrSpace != 1 && addrSpace != 2)
           continue;
 
         StringRef argName = F.getArg(i)->getName();
@@ -234,7 +234,7 @@ PreservedAnalyses AIRSystemValuesPass::run(Module &M,
           snprintf(nameBuf, sizeof(nameBuf), "%u", i);
           argName = nameBuf;
         }
-        const char *accessMode = (AS == 2) ? air::kMDRead : air::kMDReadWrite;
+        const char *accessMode = (addrSpace == 2) ? air::kMDRead : air::kMDReadWrite;
         paramNodes.push_back(MDNode::get(
             Ctx, {ConstantAsMetadata::get(ConstantInt::get(I32, i)),
                   MDString::get(Ctx, air::kMDBuffer),
@@ -243,7 +243,7 @@ PreservedAnalyses AIRSystemValuesPass::run(Module &M,
                   ConstantAsMetadata::get(ConstantInt::get(I32, 1)),
                   MDString::get(Ctx, accessMode),
                   MDString::get(Ctx, air::kMDAddressSpace),
-                  ConstantAsMetadata::get(ConstantInt::get(I32, AS)),
+                  ConstantAsMetadata::get(ConstantInt::get(I32, addrSpace)),
                   MDString::get(Ctx, air::kMDArgTypeSize),
                   ConstantAsMetadata::get(ConstantInt::get(I32, 4)),
                   MDString::get(Ctx, air::kMDArgTypeAlignSize),

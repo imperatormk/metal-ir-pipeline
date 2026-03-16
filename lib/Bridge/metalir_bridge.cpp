@@ -4,6 +4,7 @@
 // Same ABI as metalasm_compile() so Triton can load either dylib.
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/KernelProfile.h"
 #include "metal-ir/MetallibWriter.h"
 
 #include "llvm/Analysis/CGSCCPassManager.h"
@@ -70,6 +71,7 @@ void *metalir_compile(const char *llText, uint64_t *outLen,
   MAM.registerPass([&] { return metalir::MMAPresenceAnalysis(); });
   MAM.registerPass([&] { return metalir::TGMemoryAnalysis(); });
   MAM.registerPass([&] { return metalir::PointeeTypeAnalysis(); });
+  MAM.registerPass([&] { return metalir::KernelProfileAnalysis(); });
 
   ModulePassManager MPM;
   metalir::buildMetalIRPipeline(MPM);

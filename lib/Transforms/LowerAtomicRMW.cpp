@@ -2,6 +2,7 @@
 
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/AIRIntrinsics.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -33,8 +34,8 @@ PreservedAnalyses LowerAtomicRMWPass::run(Module &M,
           atomics.push_back(RMW);
 
   for (auto *RMW : atomics) {
-    unsigned AS = RMW->getPointerOperand()->getType()->getPointerAddressSpace();
-    auto locality = (AS == 3) ? air::AtomicLocality::Local
+    unsigned addrSpace = RMW->getPointerOperand()->getType()->getPointerAddressSpace();
+    auto locality = (addrSpace == AS::Threadgroup) ? air::AtomicLocality::Local
                               : air::AtomicLocality::Global;
     air::AtomicOp airOp;
     switch (RMW->getOperation()) {
@@ -57,7 +58,7 @@ PreservedAnalyses LowerAtomicRMWPass::run(Module &M,
                                      : air::AtomicType::I32;
     std::string name = air::atomicName(locality, airOp, airTy);
 
-    auto *ptrTy = PointerType::get(Ctx, AS);
+    auto *ptrTy = PointerType::get(Ctx, addrSpace);
     FunctionType *FTy = FunctionType::get(valTy, {ptrTy, valTy, I32, I32, I1}, false);
     FunctionCallee FC = M.getOrInsertFunction(name, FTy);
 

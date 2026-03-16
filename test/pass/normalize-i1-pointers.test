@@ -1,0 +1,3 @@
+PASS: normalize-i1-pointers
+CHECK: getelementptr i8
+CHECK-NOT: getelementptr i1

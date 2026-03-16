@@ -1,0 +1,4 @@
+PASS: air-system-values
+CHECK: !air.kernel
+CHECK: !air.version
+CHECK-NOT: call [3 x i32] @air.threadgroup_position_in_grid

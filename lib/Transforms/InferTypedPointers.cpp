@@ -5,15 +5,13 @@
 // opaque pointers. This pass populates the PointeeTypeMap analysis with
 // inferred types for all pointer values.
 //
-// Unlike MetalASM which mutates pointer types in its own IR, we keep
-// the LLVM Module unchanged (opaque ptrs) and store type info in the
-// side table. The custom bitcode writer reads the side table.
-//
-// This pass implements the equivalent of MetalASM's
-// transformInferOpaquePointerTypes (lines 1454-1830).
+// Includes MMA-specific overrides (formerly Pass 16: MMATypedPointers):
+// when MMA intrinsics are present, all device ptrs → float*, MMA
+// load/store params → float*, call site args → float*.
 // ═══════════════════════════════════════════════════════════════════════
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PointeeTypeMap.h"
 
 #include "llvm/IR/InstIterator.h"
@@ -22,6 +20,9 @@
 using namespace llvm;
 
 namespace metalir {
+
+static constexpr const char *kMMALoad = "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
+static constexpr const char *kMMAStore = "air.simdgroup_matrix_8x8_store.v64f32.p3f32";
 
 bool InferTypedPointersPass::needsRun(Module &M) {
   // Always useful to run — populates PointeeTypeMap for bitcode emission
@@ -35,26 +36,19 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
   // We refine it here with Metal-specific rules.
   auto &PTM = AM.getResult<PointeeTypeAnalysis>(M);
 
-  bool hasMMA = false;
+  MetalConstraints constraints;
+  constraints.hasMMA = AM.getResult<MMAPresenceAnalysis>(M).hasMMA;
+  Type *F32 = Type::getFloatTy(M.getContext());
+
+  // Phase 0: Map function pointers.
   for (auto &F : M) {
-    if (F.getName().contains("multiply_accumulate")) {
-      hasMMA = true;
+    if (!F.isDeclaration()) {
+      PTM.set(&F, F.getFunctionType());
       break;
     }
   }
 
-  // Phase 0: Map function pointers.
-  // In LLVM opaque ptr world, all functions share `ptr` type.
-  // Record the kernel function's type as the pointee for ptr-to-fn.
-  for (auto &F : M) {
-    if (!F.isDeclaration()) {
-      PTM.set(&F, F.getFunctionType());
-      break; // only need one (v1 FUNCTION records use fn type directly)
-    }
-  }
-
   // Phase 1: Fill gaps — pointers with no inferred type.
-  // Try harder: follow phi chains, inttoptr sources, etc.
   for (auto &F : M) {
     for (auto &BB : F) {
       for (auto &I : BB) {
@@ -85,28 +79,64 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
     }
   }
 
-  // Phase 2: Apply Metal constraints
-  // i1* → i8* (Metal has no i1 memory type)
+  // Phase 2: Apply Metal constraints — i1* → i8*
   PTM.remapI1ToI8(M);
 
   // Phase 3: If MMA present, all device pointers → float*
-  if (hasMMA)
+  if (constraints.hasMMA)
     PTM.collapseDevicePointersToFloat(M);
 
   // Phase 4: Default unresolved device pointers to float*
-  Type *F32 = Type::getFloatTy(M.getContext());
   for (auto &F : M) {
     for (auto &Arg : F.args()) {
       if (!Arg.getType()->isPointerTy() || PTM.has(&Arg))
         continue;
       if (auto *PT = dyn_cast<PointerType>(Arg.getType())) {
-        if (PT->getAddressSpace() == 1) // device
+        if (PT->getAddressSpace() == AS::Device)
           PTM.set(&Arg, F32);
       }
     }
   }
 
-  return PreservedAnalyses::all(); // We only wrote to the side table
+  // Phase 5: MMA-specific overrides (formerly MMATypedPointersPass)
+  if (constraints.hasMMA) {
+    // MMA load/store declaration params → float*
+    for (auto &F : M) {
+      if (!F.isDeclaration()) continue;
+      StringRef name = F.getName();
+      if (name == kMMALoad || name == kMMAStore) {
+        for (auto &Arg : F.args())
+          if (Arg.getType()->isPointerTy())
+            PTM.set(&Arg, F32);
+      }
+    }
+
+    // ALL kernel device pointer args → float* (GPU JIT crashes on half*)
+    for (auto &F : M) {
+      if (F.isDeclaration()) continue;
+      for (auto &Arg : F.args())
+        if (Arg.getType()->isPointerTy() &&
+            Arg.getType()->getPointerAddressSpace() == AS::Device)
+          PTM.set(&Arg, F32);
+    }
+
+    // MMA call site pointer operands → float*
+    for (auto &F : M) {
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CI = dyn_cast<CallInst>(&I);
+          if (!CI || !CI->getCalledFunction()) continue;
+          StringRef name = CI->getCalledFunction()->getName();
+          if (name == kMMALoad || name == kMMAStore)
+            for (unsigned i = 0; i < CI->arg_size(); i++)
+              if (CI->getArgOperand(i)->getType()->isPointerTy())
+                PTM.set(CI->getArgOperand(i), F32);
+        }
+      }
+    }
+  }
+
+  return PreservedAnalyses::all();
 }
 
 } // namespace metalir

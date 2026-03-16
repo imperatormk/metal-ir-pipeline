@@ -1,0 +1,3 @@
+PASS: nan-min-max
+CHECK: air.fmin.f32
+CHECK-NOT: llvm.minimum

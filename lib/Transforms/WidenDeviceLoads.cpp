@@ -20,6 +20,8 @@
 // This pass queries MMAPresenceAnalysis and skips if no MMA.
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/IRUtil.h"
+#include "metal-ir/KernelProfile.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -37,9 +39,8 @@ hasMMA:
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB)
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == 1 && !LI->getType()->isFloatTy())
-            return true;
+        if (isDeviceLoad(&I) && !cast<LoadInst>(&I)->getType()->isFloatTy())
+          return true;
   return false;
 }
 
@@ -85,21 +86,28 @@ static bool decomposeGEP(GetElementPtrInst *GEP, Value *&base,
 
 PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
                                              ModuleAnalysisManager &MAM) {
-  // Check MMA presence
-  auto &MMA = MAM.getResult<MMAPresenceAnalysis>(M);
-  if (!MMA.hasMMA) return PreservedAnalyses::all();
+  // Query constraints: only widen when MMA present
+  MetalConstraints constraints;
+  constraints.hasMMA = MAM.getResult<MMAPresenceAnalysis>(M).hasMMA;
+  if (!constraints.widenDeviceLoadsToFloat()) return PreservedAnalyses::all();
 
   bool changed = false;
   Type *F32 = Type::getFloatTy(M.getContext());
+  auto &profiles = MAM.getResult<KernelProfileAnalysis>(M);
 
   // Collect non-float device loads
   SmallVector<LoadInst *, 16> loadsToWiden;
-  for (auto &F : M)
+  for (auto &F : M) {
+    // Early exit: skip functions without non-float device loads
+    auto it = profiles.find(&F);
+    if (it != profiles.end() && !it->second.needsDeviceLoadWidening()
+        && !it->second.hasNonFloatDeviceStore)
+      continue;
     for (auto &BB : F)
       for (auto &I : BB)
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == 1 && !LI->getType()->isFloatTy())
-            loadsToWiden.push_back(LI);
+        if (isDeviceLoad(&I) && !cast<LoadInst>(&I)->getType()->isFloatTy())
+          loadsToWiden.push_back(cast<LoadInst>(&I));
+  }
 
   for (auto *LI : loadsToWiden) {
     Type *origTy = LI->getType();
@@ -195,13 +203,16 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
 
   // Widen non-float device stores (reverse of load widening)
   SmallVector<StoreInst *, 16> storesToWiden;
-  for (auto &F : M)
+  for (auto &F : M) {
+    auto it = profiles.find(&F);
+    if (it != profiles.end() && !it->second.hasNonFloatDeviceStore)
+      continue;
     for (auto &BB : F)
       for (auto &I : BB)
-        if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == 1 &&
-              !SI->getValueOperand()->getType()->isFloatTy())
-            storesToWiden.push_back(SI);
+        if (isDeviceStore(&I) &&
+            !cast<StoreInst>(&I)->getValueOperand()->getType()->isFloatTy())
+          storesToWiden.push_back(cast<StoreInst>(&I));
+  }
 
   for (auto *SI : storesToWiden) {
     Value *val = SI->getValueOperand();
@@ -262,7 +273,7 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
             auto *GEP = dyn_cast<GetElementPtrInst>(&*II++);
             if (!GEP) continue;
             if (!GEP->use_empty()) continue;
-            if (GEP->getPointerAddressSpace() != 1) continue;
+            if (GEP->getPointerAddressSpace() != AS::Device) continue;
             auto *srcTy = GEP->getSourceElementType();
             if (!srcTy->isFloatTy()) {
               GEP->eraseFromParent();

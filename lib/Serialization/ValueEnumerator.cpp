@@ -83,12 +83,12 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
         if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
           if (GEP->getType()->isPointerTy()) {
             Type *resultPointee = GEP->getResultElementType();
-            unsigned AS = GEP->getType()->getPointerAddressSpace();
-            if (AS != 3 || !resultPointee->isIntegerTy(8)) {
+            unsigned addrSpace = GEP->getType()->getPointerAddressSpace();
+            if (addrSpace != 3 || !resultPointee->isIntegerTy(8)) {
               if (auto *ptmTy = PTM.get(GEP))
                 resultPointee = ptmTy;
             }
-            ptrTypeIdx(PointerType::get(M.getContext(), AS), resultPointee);
+            ptrTypeIdx(PointerType::get(M.getContext(), addrSpace), resultPointee);
           }
         }
         // Bitcast ptr→ptr: in Metal v1 these change typed pointer.
@@ -96,8 +96,8 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
         if (auto *BC = dyn_cast<BitCastInst>(&I)) {
           if (BC->getType()->isPointerTy() && BC->getSrcTy() == BC->getDestTy()) {
             if (auto *ptmTy = PTM.get(BC)) {
-              unsigned AS = BC->getType()->getPointerAddressSpace();
-              ptrTypeIdx(PointerType::get(M.getContext(), AS), ptmTy);
+              unsigned addrSpace = BC->getType()->getPointerAddressSpace();
+              ptrTypeIdx(PointerType::get(M.getContext(), addrSpace), ptmTy);
             }
           }
         }
@@ -189,8 +189,8 @@ Type *ValueEnumerator::pointeeType(Type *PtrTy) const {
   auto it = inferredPointee.find(PtrTy);
   if (it != inferredPointee.end()) return it->second;
   if (auto *PT = dyn_cast<PointerType>(PtrTy)) {
-    unsigned AS = PT->getAddressSpace();
-    if (AS == 1 || AS == 3) return Type::getFloatTy(PtrTy->getContext());
+    unsigned addrSpace = PT->getAddressSpace();
+    if (addrSpace == 1 || addrSpace == 3) return Type::getFloatTy(PtrTy->getContext());
   }
   return Type::getFloatTy(PtrTy->getContext());
 }
@@ -279,8 +279,8 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
     if (F && F->isDeclaration()) {
       StringRef name = F->getName();
       if (name.starts_with("air.atomic.")) {
-        unsigned AS = cast<PointerType>(PT)->getAddressSpace();
-        if (AS == 1 || AS == 3) {
+        unsigned addrSpace = cast<PointerType>(PT)->getAddressSpace();
+        if (addrSpace == 1 || addrSpace == 3) {
           // Determine pointee from intrinsic name suffix
           if (name.ends_with(".i32"))
             pointee = Type::getInt32Ty(F->getContext());

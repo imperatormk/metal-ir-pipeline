@@ -4,6 +4,7 @@
 
 #include "metal-ir/BitcodeEmitter.h"
 #include "metal-ir/BitcodeEncoding.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/ValueEnumerator.h"
 #include "llvm/Bitcode/LLVMBitCodes.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
@@ -50,7 +51,7 @@ static void lowerConstantExprs(Module &M) {
         // Convert byte-stride GEPs on TG float globals to float-element GEPs.
         if (auto *GEP = dyn_cast<GetElementPtrInst>(NewI)) {
           if (GEP->getSourceElementType()->isIntegerTy(8) &&
-              GEP->getPointerAddressSpace() == 3 &&
+              GEP->getPointerAddressSpace() == metalir::AS::Threadgroup &&
               GEP->getNumIndices() == 1) {
             // Check if base is a TG global with float array element type
             Value *base = GEP->getPointerOperand();

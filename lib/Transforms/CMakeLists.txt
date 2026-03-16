@@ -22,7 +22,6 @@ add_library(MetalIRTransforms
   WidenDeviceLoads.cpp
   ScalarStoreGuard.cpp
   SplitI64Shuffle.cpp
-  MMATypedPointers.cpp
   BFloat16CastDecompose.cpp
   InferTypedPointers.cpp
   ScalarBufferPacking.cpp
@@ -30,6 +29,7 @@ add_library(MetalIRTransforms
   NormalizeI1Pointers.cpp
   NormalizeAllocas.cpp
   PointeeTypeMap.cpp
+  KernelProfile.cpp
 )
 
 target_link_libraries(MetalIRTransforms ${llvm_libs})

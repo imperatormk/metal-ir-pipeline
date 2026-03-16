@@ -16,6 +16,7 @@
 // We trace these chains to find the scalar value for each element.
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/KernelProfile.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -63,8 +64,14 @@ bool DecomposeStructPhisPass::needsRun(Module &M) {
 PreservedAnalyses DecomposeStructPhisPass::run(Module &M,
                                                 ModuleAnalysisManager &AM) {
   bool changed = false;
+  auto &profiles = AM.getResult<KernelProfileAnalysis>(M);
 
   for (auto &F : M) {
+    // Early exit: KernelProfile says no struct PHIs in this function
+    auto it = profiles.find(&F);
+    if (it != profiles.end() && !it->second.hasStructPhi)
+      continue;
+
     // Collect struct phis (can't modify while iterating)
     SmallVector<PHINode *, 8> structPhis;
     for (auto &BB : F)

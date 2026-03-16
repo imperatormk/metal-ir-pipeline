@@ -1,0 +1,5 @@
+MODE: dump-profile
+CHECK: hasDeviceStore
+CHECK: isScalarKernel
+CHECK-NOT: hasPerThreadIndex
+CHECK-NOT: hasTGStore

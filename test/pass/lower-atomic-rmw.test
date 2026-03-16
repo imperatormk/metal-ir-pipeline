@@ -1,0 +1,3 @@
+PASS: lower-atomic-rmw
+CHECK: air.atomic.global
+CHECK-NOT: atomicrmw

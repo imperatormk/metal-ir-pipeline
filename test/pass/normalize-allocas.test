@@ -1,0 +1,3 @@
+PASS: normalize-allocas
+CHECK: alloca float, i32 4
+CHECK-NOT: alloca float, i64 4

@@ -1,0 +1,4 @@
+PASS: scalar-buffer-packing
+CHECK: ptr addrspace(1) %_scalar_buf
+CHECK: getelementptr inbounds float, ptr addrspace(1) %_scalar_buf
+CHECK-NOT: define void @test_kernel(ptr addrspace(1) %out, i32 %n, float %scale)

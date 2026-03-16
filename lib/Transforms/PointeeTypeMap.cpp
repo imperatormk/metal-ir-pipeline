@@ -1,7 +1,8 @@
 #include "metal-ir/PointeeTypeMap.h"
+#include "metal-ir/IRUtil.h"
+#include "metal-ir/MetalConstraints.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
 
 using namespace llvm;
 
@@ -11,11 +12,8 @@ AnalysisKey PointeeTypeAnalysis::Key;
 
 // ── Infer pointee type from usage ────────────────────────────────────────
 //
-// Walk uses of a pointer and determine what it points to:
-//   load float, ptr %p          → float
-//   store i32 %v, ptr %p        → i32
-//   getelementptr float, ptr %p → float (GEP source type)
-//   phi [ptr %a, ptr %b]        → recurse into %a, %b
+// Delegates to inferElementType (IRUtil.h) for load/store/GEP recursion,
+// then falls back to GEP source type and atomic intrinsic name inference.
 
 Type *PointeeTypeMap::inferFromUsage(Value *ptr) {
   // Prioritize load/store types over GEP source types.
@@ -30,15 +28,11 @@ Type *PointeeTypeMap::inferFromUsage(Value *ptr) {
         return SI->getValueOperand()->getType();
     }
     if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-      // Recurse: what does the GEP result get used for?
       if (Type *T = inferFromUsage(GEP))
         return T;
       if (!gepType)
         gepType = GEP->getSourceElementType();
     }
-    // Infer from atomic intrinsic calls: air.atomic.*.i32 → i32,
-    // air.atomic.*.f32 → float. This ensures device pointers used
-    // only in atomics get the correct typed pointer (not default float*).
     if (auto *CI = dyn_cast<CallInst>(U)) {
       if (auto *Callee = CI->getCalledFunction()) {
         StringRef name = Callee->getName();
@@ -67,7 +61,7 @@ void PointeeTypeMap::collapseDevicePointersToFloat(Module &M) {
     // Check if this is a device pointer (addrspace 1)
     auto *ptrTy = ptr->getType();
     if (auto *PT = dyn_cast<PointerType>(ptrTy)) {
-      if (PT->getAddressSpace() == 1)
+      if (PT->getAddressSpace() == AS::Device)
         ty = F32;
     }
   }

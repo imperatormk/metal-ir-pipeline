@@ -1,0 +1,3 @@
+PASS: scalar-store-guard
+CHECK-NOT: guard_is_t0
+CHECK-NOT: icmp eq i32

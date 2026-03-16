@@ -14,16 +14,14 @@
 
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/AIRIntrinsics.h"
+#include "metal-ir/IRUtil.h"
+#include "metal-ir/KernelProfile.h"
+#include "metal-ir/MetalConstraints.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 
 using namespace llvm;
 namespace metalir {
-
-static bool isTGPtr(Value *V) {
-  return V->getType()->isPointerTy() &&
-         V->getType()->getPointerAddressSpace() == 3;
-}
 
 static bool isBarrierCall(Instruction *I) {
   if (auto *CI = dyn_cast<CallInst>(I))
@@ -42,33 +40,33 @@ static CallInst *createBarrier(IRBuilder<> &B, Module &M) {
 }
 
 bool TGBarrierInsertPass::needsRun(Module &M) {
-  // Needed if there are TG stores
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB)
-        if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == 3)
-            return true;
+        if (isTGStore(&I))
+          return true;
   return false;
 }
 
 PreservedAnalyses TGBarrierInsertPass::run(Module &M,
                                             ModuleAnalysisManager &AM) {
   bool changed = false;
+  auto &profiles = AM.getResult<KernelProfileAnalysis>(M);
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
+
+    // Early exit: KernelProfile says no TG stores in this function
+    auto it = profiles.find(&F);
+    if (it != profiles.end() && !it->second.needsTGBarriers())
+      continue;
 
     // Collect blocks with TG stores and TG loads
     SmallPtrSet<BasicBlock *, 8> tgStoreBlocks, tgLoadBlocks;
     for (auto &BB : F) {
       for (auto &I : BB) {
-        if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == 3)
-            tgStoreBlocks.insert(&BB);
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == 3)
-            tgLoadBlocks.insert(&BB);
+        if (isTGStore(&I)) tgStoreBlocks.insert(&BB);
+        if (isTGLoad(&I)) tgLoadBlocks.insert(&BB);
       }
     }
     if (tgStoreBlocks.empty()) continue;
@@ -88,9 +86,7 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
       if (!tgStoreBlocks.count(&BB) || condTargets.count(&BB))
         continue;
       for (auto it = BB.begin(); it != BB.end(); ++it) {
-        auto *SI = dyn_cast<StoreInst>(&*it);
-        if (!SI || SI->getPointerAddressSpace() != 3)
-          continue;
+        if (!isTGStore(&*it)) continue;
         // Check if already preceded by barrier
         if (it != BB.begin()) {
           auto prev = std::prev(it);
@@ -133,9 +129,7 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
       // Find the last TG load in this block
       Instruction *lastTGLoad = nullptr;
       for (auto &I : BB) {
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == 3)
-            lastTGLoad = &I;
+        if (isTGLoad(&I)) lastTGLoad = &I;
       }
       if (!lastTGLoad) continue;
 

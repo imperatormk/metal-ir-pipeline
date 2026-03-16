@@ -1,0 +1,3 @@
+PASS: tg-barrier-insert
+CHECK: call void @air.wg.barrier
+CHECK: store float %v, ptr addrspace(3)
