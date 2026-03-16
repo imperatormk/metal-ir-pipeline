@@ -186,63 +186,8 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
     }
 
     // Scalarize <1 x T> for merge candidate only
-    SmallVector<Instruction *, 8> vec1Users;
-    std::function<void(Value *)> findVec1 = [&](Value *V) {
-      for (auto *U : V->users()) {
-        if (auto *SI = dyn_cast<StoreInst>(U)) {
-          if (SI->getPointerOperand() == V) {
-            auto *VT = dyn_cast<FixedVectorType>(SI->getValueOperand()->getType());
-            if (VT && VT->getNumElements() == 1) vec1Users.push_back(SI);
-          }
-        } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-          auto *VT = dyn_cast<FixedVectorType>(LI->getType());
-          if (VT && VT->getNumElements() == 1) vec1Users.push_back(LI);
-        } else if (isa<GetElementPtrInst>(U)) {
-          findVec1(U);
-        }
-      }
-    };
-    findVec1(byteGV);
-    for (auto *I : vec1Users) {
-      if (auto *SI = dyn_cast<StoreInst>(I)) {
-        IRBuilder<> B(SI);
-        Value *scalar = B.CreateExtractElement(SI->getValueOperand(),
-            ConstantInt::get(I32, 0));
-        B.CreateAlignedStore(scalar, SI->getPointerOperand(),
-            SI->getAlign(), SI->isVolatile());
-        SI->eraseFromParent();
-        changed = true;
-      } else if (auto *LI = dyn_cast<LoadInst>(I)) {
-        IRBuilder<> B(LI);
-        auto *VT = cast<FixedVectorType>(LI->getType());
-        auto *scalar = B.CreateAlignedLoad(VT->getElementType(),
-            LI->getPointerOperand(), LI->getAlign(), LI->isVolatile());
-        Value *vec = B.CreateInsertElement(
-            UndefValue::get(VT), scalar, ConstantInt::get(I32, 0));
-        LI->replaceAllUsesWith(vec);
-        LI->eraseFromParent();
-        changed = true;
-      }
-    }
-    // Fold extract(insert(undef, x, 0), 0) → x
-    for (auto &F : M) {
-      for (auto &BB : F) {
-        for (auto it = BB.begin(); it != BB.end();) {
-          Instruction &I = *it++;
-          if (auto *EE = dyn_cast<ExtractElementInst>(&I)) {
-            if (auto *IE = dyn_cast<InsertElementInst>(EE->getVectorOperand())) {
-              auto *VT = dyn_cast<FixedVectorType>(IE->getType());
-              if (VT && VT->getNumElements() == 1) {
-                EE->replaceAllUsesWith(IE->getOperand(1));
-                EE->eraseFromParent();
-                if (IE->use_empty()) IE->eraseFromParent();
-                changed = true;
-              }
-            }
-          }
-        }
-      }
-    }
+    changed |= scalarizeVec1Users(byteGV, I32);
+    changed |= foldExtractInsert(M);
   }
   // After early split, try to merge each remaining byte global with
   // the MMA global if types are compatible and it saves TG memory.
@@ -430,65 +375,8 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
 
     // Scalarize <1 x T> store/load for THIS global before retyping.
     // After retype, pointer is typed as T* — <1 x T> through T* crashes.
-    {
-      SmallVector<Instruction *, 8> vec1Users;
-      std::function<void(Value *)> findVec1 = [&](Value *V) {
-        for (auto *U : V->users()) {
-          if (auto *SI = dyn_cast<StoreInst>(U)) {
-            if (SI->getPointerOperand() == V) {
-              auto *VT = dyn_cast<FixedVectorType>(SI->getValueOperand()->getType());
-              if (VT && VT->getNumElements() == 1) vec1Users.push_back(SI);
-            }
-          } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-            auto *VT = dyn_cast<FixedVectorType>(LI->getType());
-            if (VT && VT->getNumElements() == 1) vec1Users.push_back(LI);
-          } else if (isa<GetElementPtrInst>(U)) {
-            findVec1(U);
-          }
-        }
-      };
-      findVec1(GV);
-      for (auto *I : vec1Users) {
-        if (auto *SI = dyn_cast<StoreInst>(I)) {
-          IRBuilder<> B(SI);
-          Value *scalar = B.CreateExtractElement(SI->getValueOperand(),
-              ConstantInt::get(I32, 0));
-          B.CreateAlignedStore(scalar, SI->getPointerOperand(),
-              SI->getAlign(), SI->isVolatile());
-          SI->eraseFromParent();
-          changed = true;
-        } else if (auto *LI = dyn_cast<LoadInst>(I)) {
-          IRBuilder<> B(LI);
-          auto *VT = cast<FixedVectorType>(LI->getType());
-          auto *scalar = B.CreateAlignedLoad(VT->getElementType(),
-              LI->getPointerOperand(), LI->getAlign(), LI->isVolatile());
-          Value *vec = B.CreateInsertElement(
-              UndefValue::get(VT), scalar, ConstantInt::get(I32, 0));
-          LI->replaceAllUsesWith(vec);
-          LI->eraseFromParent();
-          changed = true;
-        }
-      }
-    }
-    // Fold extract(insert(undef, x, 0), 0) → x
-    for (auto &F : M) {
-      for (auto &BB : F) {
-        for (auto it = BB.begin(); it != BB.end();) {
-          Instruction &I = *it++;
-          if (auto *EE = dyn_cast<ExtractElementInst>(&I)) {
-            if (auto *IE = dyn_cast<InsertElementInst>(EE->getVectorOperand())) {
-              auto *VT = dyn_cast<FixedVectorType>(IE->getType());
-              if (VT && VT->getNumElements() == 1) {
-                EE->replaceAllUsesWith(IE->getOperand(1));
-                EE->eraseFromParent();
-                if (IE->use_empty()) IE->eraseFromParent();
-                changed = true;
-              }
-            }
-          }
-        }
-      }
-    }
+    changed |= scalarizeVec1Users(GV, I32);
+    changed |= foldExtractInsert(M);
 
     // Re-infer storeTy after scalarization (<1 x float> → float)
     storeTy = inferElementType(GV);

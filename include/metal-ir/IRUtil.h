@@ -9,6 +9,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 
 namespace metalir {
 
@@ -104,6 +105,89 @@ inline llvm::Value *createElementIndex(llvm::IRBuilder<> &B,
   return B.CreateUDiv(byteIdx,
                        llvm::ConstantInt::get(byteIdx->getType(), elemSizeBytes),
                        "elem_idx");
+}
+
+// ── Vec1 scalarization ────────────────────────────────────────────────────
+// Replace <1 x T> store/load through a pointer with scalar store/load.
+// Duplicated in TGGlobalGEPRewrite and TGGlobalCoalesce.
+// Returns true if any changes were made.
+
+inline bool scalarizeVec1Users(llvm::Value *V, llvm::Type *I32Ty) {
+  bool changed = false;
+  llvm::SmallVector<llvm::Instruction *, 8> vec1Users;
+  std::function<void(llvm::Value *)> findVec1 = [&](llvm::Value *V) {
+    for (auto *U : V->users()) {
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(U)) {
+        if (SI->getPointerOperand() == V) {
+          auto *VT = llvm::dyn_cast<llvm::FixedVectorType>(
+              SI->getValueOperand()->getType());
+          if (VT && VT->getNumElements() == 1) vec1Users.push_back(SI);
+        }
+      } else if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(U)) {
+        auto *VT = llvm::dyn_cast<llvm::FixedVectorType>(LI->getType());
+        if (VT && VT->getNumElements() == 1) vec1Users.push_back(LI);
+      } else if (llvm::isa<llvm::GetElementPtrInst>(U)) {
+        findVec1(U);
+      }
+    }
+  };
+  findVec1(V);
+  for (auto *I : vec1Users) {
+    if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(I)) {
+      llvm::IRBuilder<> B(SI);
+      llvm::Value *scalar = B.CreateExtractElement(
+          SI->getValueOperand(), llvm::ConstantInt::get(I32Ty, 0));
+      B.CreateAlignedStore(scalar, SI->getPointerOperand(), SI->getAlign(),
+                           SI->isVolatile());
+      SI->eraseFromParent();
+      changed = true;
+    } else if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(I)) {
+      llvm::IRBuilder<> B(LI);
+      auto *VT = llvm::cast<llvm::FixedVectorType>(LI->getType());
+      auto *scalar = B.CreateAlignedLoad(VT->getElementType(),
+                                          LI->getPointerOperand(),
+                                          LI->getAlign(), LI->isVolatile());
+      llvm::Value *vec = B.CreateInsertElement(
+          llvm::UndefValue::get(VT), scalar, llvm::ConstantInt::get(I32Ty, 0));
+      LI->replaceAllUsesWith(vec);
+      LI->eraseFromParent();
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// ── Fold extract(insert(undef, x, 0), 0) → x ─────────────────────────────
+// Cleans up after vec1 scalarization. Returns true if any changes were made.
+
+inline bool foldExtractInsert(llvm::Function &F) {
+  bool changed = false;
+  for (auto &BB : F) {
+    for (auto it = BB.begin(); it != BB.end();) {
+      llvm::Instruction &I = *it++;
+      if (auto *EE = llvm::dyn_cast<llvm::ExtractElementInst>(&I)) {
+        if (auto *IE =
+                llvm::dyn_cast<llvm::InsertElementInst>(EE->getVectorOperand())) {
+          auto *VT = llvm::dyn_cast<llvm::FixedVectorType>(IE->getType());
+          if (VT && VT->getNumElements() == 1) {
+            EE->replaceAllUsesWith(IE->getOperand(1));
+            EE->eraseFromParent();
+            if (IE->use_empty()) IE->eraseFromParent();
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+  return changed;
+}
+
+// Module-wide version
+inline bool foldExtractInsert(llvm::Module &M) {
+  bool changed = false;
+  for (auto &F : M)
+    changed |= foldExtractInsert(F);
+  return changed;
 }
 
 } // namespace metalir
