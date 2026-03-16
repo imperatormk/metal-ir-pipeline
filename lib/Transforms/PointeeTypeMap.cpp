@@ -1,8 +1,8 @@
 #include "metal-ir/PointeeTypeMap.h"
+#include "metal-ir/IRUtil.h"
 #include "metal-ir/MetalConstraints.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
 
 using namespace llvm;
 
@@ -12,48 +12,34 @@ AnalysisKey PointeeTypeAnalysis::Key;
 
 // ── Infer pointee type from usage ────────────────────────────────────────
 //
-// Walk uses of a pointer and determine what it points to:
-//   load float, ptr %p          → float
-//   store i32 %v, ptr %p        → i32
-//   getelementptr float, ptr %p → float (GEP source type)
-//   phi [ptr %a, ptr %b]        → recurse into %a, %b
+// Delegates to inferElementType (IRUtil.h) for load/store/GEP recursion,
+// then falls back to GEP source type and atomic intrinsic name inference.
 
 Type *PointeeTypeMap::inferFromUsage(Value *ptr) {
-  // Prioritize load/store types over GEP source types.
-  // Recurse through GEP chains to find the ultimate store/load type.
-  Type *gepType = nullptr;
-  Type *atomicType = nullptr;
+  // Primary: load/store types via recursive user walk (shared with TG passes)
+  if (Type *T = inferElementType(ptr))
+    return T;
+
+  // Fallback 1: GEP source element type
+  for (auto *U : ptr->users())
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U))
+      return GEP->getSourceElementType();
+
+  // Fallback 2: atomic intrinsic name → type
   for (auto *U : ptr->users()) {
-    if (auto *LI = dyn_cast<LoadInst>(U))
-      return LI->getType();
-    if (auto *SI = dyn_cast<StoreInst>(U)) {
-      if (SI->getPointerOperand() == ptr)
-        return SI->getValueOperand()->getType();
-    }
-    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-      // Recurse: what does the GEP result get used for?
-      if (Type *T = inferFromUsage(GEP))
-        return T;
-      if (!gepType)
-        gepType = GEP->getSourceElementType();
-    }
-    // Infer from atomic intrinsic calls: air.atomic.*.i32 → i32,
-    // air.atomic.*.f32 → float. This ensures device pointers used
-    // only in atomics get the correct typed pointer (not default float*).
     if (auto *CI = dyn_cast<CallInst>(U)) {
       if (auto *Callee = CI->getCalledFunction()) {
         StringRef name = Callee->getName();
-        if (name.starts_with("air.atomic.") && !atomicType) {
+        if (name.starts_with("air.atomic.")) {
           if (name.ends_with(".i32"))
-            atomicType = Type::getInt32Ty(ptr->getContext());
-          else if (name.ends_with(".f32"))
-            atomicType = Type::getFloatTy(ptr->getContext());
+            return Type::getInt32Ty(ptr->getContext());
+          if (name.ends_with(".f32"))
+            return Type::getFloatTy(ptr->getContext());
         }
       }
     }
   }
-  if (gepType) return gepType;
-  return atomicType;
+  return nullptr;
 }
 
 // ── Collapse device pointers to float* ───────────────────────────────────
