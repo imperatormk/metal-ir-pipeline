@@ -1,5 +1,6 @@
 #include "metal-ir/ValueEnumerator.h"
 #include "metal-ir/BitcodeEncoding.h"
+#include "metal-ir/MetalConstraints.h"
 #include "llvm/Bitcode/LLVMBitCodes.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
 #include "llvm/IR/Instructions.h"
@@ -128,7 +129,7 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         // all terminal users (following GEP chains) consume float. If any
         // terminal user is a non-float load/store/atomic, keep i32.
         Type *gepSrcTy = GEP->getSourceElementType();
-        if (GEP->getPointerAddressSpace() == 1 &&
+        if (GEP->getPointerAddressSpace() == metalir::AS::Device &&
             gepSrcTy->isIntegerTy(32)) {
           // Walk GEP chains to find terminal (non-GEP) users
           bool allTerminalFloat = true;

@@ -2,6 +2,7 @@
 
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/AIRIntrinsics.h"
+#include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -34,7 +35,7 @@ PreservedAnalyses LowerAtomicRMWPass::run(Module &M,
 
   for (auto *RMW : atomics) {
     unsigned AS = RMW->getPointerOperand()->getType()->getPointerAddressSpace();
-    auto locality = (AS == 3) ? air::AtomicLocality::Local
+    auto locality = (AS == metalir::AS::Threadgroup) ? air::AtomicLocality::Local
                               : air::AtomicLocality::Global;
     air::AtomicOp airOp;
     switch (RMW->getOperation()) {
