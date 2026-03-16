@@ -22,7 +22,6 @@ add_library(MetalIRTransforms
   WidenDeviceLoads.cpp
   ScalarStoreGuard.cpp
   SplitI64Shuffle.cpp
-  MMATypedPointers.cpp
   BFloat16CastDecompose.cpp
   InferTypedPointers.cpp
   ScalarBufferPacking.cpp

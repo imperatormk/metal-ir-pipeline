@@ -117,12 +117,6 @@ struct InferTypedPointersPass : llvm::PassInfoMixin<InferTypedPointersPass> {
   static bool needsRun(llvm::Module &M);
 };
 
-// Pass 16: Fix MMA intrinsic param types to typed pointers.
-struct MMATypedPointersPass : llvm::PassInfoMixin<MMATypedPointersPass> {
-  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);
-  static bool needsRun(llvm::Module &M);
-};
-
 // Pass 17: Decompose bf16 casts via float intermediate.
 struct BFloat16CastDecomposePass
     : llvm::PassInfoMixin<BFloat16CastDecomposePass> {
@@ -177,7 +171,7 @@ struct WidenDeviceLoadsPass : llvm::PassInfoMixin<WidenDeviceLoadsPass> {
 
 // ── Analysis: MMA Presence ────────────────────────────────────────────────
 // Cached answer to "does this module have simdgroup_matrix_8x8 intrinsics?"
-// Queried by InferTypedPointers, MMATypedPointers, WidenDeviceLoads,
+// Queried by InferTypedPointers, WidenDeviceLoads,
 // AIRSystemValues (scalar packing), and BitcodeWriter.
 
 struct MMAPresence {

@@ -88,8 +88,6 @@ static bool addNamedPass(ModulePassManager &MPM, StringRef name) {
     MPM.addPass(metalir::TGGlobalGEPRewritePass());
   else if (name == "infer-typed-pointers")
     MPM.addPass(metalir::InferTypedPointersPass());
-  else if (name == "mma-typed-pointers")
-    MPM.addPass(metalir::MMATypedPointersPass());
   else if (name == "scalar-buffer-packing")
     MPM.addPass(metalir::ScalarBufferPackingPass());
   else if (name == "scalar-store-guard")

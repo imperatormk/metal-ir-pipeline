@@ -106,9 +106,8 @@ void buildMetalIRPipeline(ModulePassManager &MPM) {
   maybeAdd(TGGlobalCoalescePass(), "TGGlobalCoalesce");
   maybeAdd(TGGlobalGEPRewritePass(), "TGGlobalGEPRewrite");
 
-  // Phase 5: Type system
+  // Phase 5: Type system (MMATypedPointers merged into InferTypedPointers)
   maybeAdd(InferTypedPointersPass(), "InferTypedPointers");
-  maybeAdd(MMATypedPointersPass(), "MMATypedPointers");
 
   // Phase 6: Kernel ABI
   maybeAdd(ScalarBufferPackingPass(), "ScalarBufferPacking");
@@ -144,7 +143,6 @@ void buildMetalIRPipeline(ModulePassManager &MPM) {
 // SplitI64ShufflePass implemented in SplitI64Shuffle.cpp
 // TGGlobalCoalescePass implemented in TGGlobalCoalesce.cpp
 // TGGlobalGEPRewritePass implemented in TGGlobalGEPRewrite.cpp
-// MMATypedPointersPass implemented in MMATypedPointers.cpp
 // ScalarStoreGuardPass implemented in ScalarStoreGuard.cpp
 // DeviceLoadsVolatilePass implemented in DeviceLoadsVolatile.cpp
 // WidenDeviceLoadsPass implemented in WidenDeviceLoads.cpp
