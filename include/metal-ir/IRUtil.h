@@ -107,6 +107,22 @@ inline llvm::Value *createElementIndex(llvm::IRBuilder<> &B,
                        "elem_idx");
 }
 
+// ── Recursive float-use check ─────────────────────────────────────────────
+// Checks if any transitive user of V loads/stores float.
+// Used by NormalizeAllocas to decide half→float GEP rewriting.
+
+inline bool hasFloatUse(llvm::Value *V) {
+  for (auto *U : V->users()) {
+    if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(U))
+      if (LI->getType()->isFloatTy()) return true;
+    if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(U))
+      if (SI->getValueOperand()->getType()->isFloatTy()) return true;
+    if (llvm::isa<llvm::GetElementPtrInst>(U))
+      if (hasFloatUse(U)) return true;
+  }
+  return false;
+}
+
 // ── Vec1 scalarization ────────────────────────────────────────────────────
 // Replace <1 x T> store/load through a pointer with scalar store/load.
 // Duplicated in TGGlobalGEPRewrite and TGGlobalCoalesce.

@@ -6,6 +6,7 @@
 
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/PassUtil.h"
+#include "metal-ir/IRUtil.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -163,19 +164,7 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
               GEP->getNumIndices() == 1 &&
               (GEP->getSourceElementType()->isHalfTy() ||
                GEP->getSourceElementType()->isBFloatTy())) {
-            // Recursive check: does any transitive user load/store float?
-            std::function<bool(Value *)> hasFloatUse = [&](Value *V) -> bool {
-              for (auto *U : V->users()) {
-                if (auto *LI = dyn_cast<LoadInst>(U))
-                  if (LI->getType()->isFloatTy()) return true;
-                if (auto *SI = dyn_cast<StoreInst>(U))
-                  if (SI->getValueOperand()->getType()->isFloatTy()) return true;
-                if (isa<GetElementPtrInst>(U))
-                  if (hasFloatUse(U)) return true;
-              }
-              return false;
-            };
-            if (hasFloatUse(GEP)) {
+            if (metalir::hasFloatUse(GEP)) {
               IRBuilder<> B(GEP);
               Type *F32 = Type::getFloatTy(M.getContext());
               Value *idx = GEP->getOperand(1);
