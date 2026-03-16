@@ -33,6 +33,7 @@ for TEST_FILE in "${TESTS[@]}"; do
 
   # Parse directives
   PASS_NAME=""
+  MODE=""
   CHECKS=()
   CHECK_NOTS=()
   INPUT_FILE=""
@@ -41,6 +42,8 @@ for TEST_FILE in "${TESTS[@]}"; do
   while IFS= read -r line; do
     if [[ "$line" =~ ^PASS:\ *(.*) ]]; then
       PASS_NAME="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^MODE:\ *(.*) ]]; then
+      MODE="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^CHECK:\ *(.*) ]]; then
       CHECKS+=("${BASH_REMATCH[1]}")
     elif [[ "$line" =~ ^CHECK-NOT:\ *(.*) ]]; then
@@ -50,8 +53,8 @@ for TEST_FILE in "${TESTS[@]}"; do
     fi
   done < "$TEST_FILE"
 
-  if [ -z "$PASS_NAME" ]; then
-    echo "SKIP $TEST_NAME (no PASS: directive)"
+  if [ -z "$PASS_NAME" ] && [ -z "$MODE" ]; then
+    echo "SKIP $TEST_NAME (no PASS: or MODE: directive)"
     continue
   fi
 
@@ -66,8 +69,13 @@ for TEST_FILE in "${TESTS[@]}"; do
     continue
   fi
 
-  # Run pass
-  OUTPUT=$("$OPT" "$INPUT_FILE" --pass="$PASS_NAME" --emit-llvm 2>&1) || {
+  # Run pass or mode
+  if [ "$MODE" = "dump-profile" ]; then
+    CMD="$OPT $INPUT_FILE --dump-profile"
+  else
+    CMD="$OPT $INPUT_FILE --pass=$PASS_NAME --emit-llvm"
+  fi
+  OUTPUT=$(eval "$CMD" 2>&1) || {
     echo "FAIL $TEST_NAME (metal-ir-opt crashed)"
     FAIL_COUNT=$((FAIL_COUNT + 1))
     continue

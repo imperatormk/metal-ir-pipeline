@@ -49,6 +49,10 @@ static cl::opt<bool> EmitLLVM("emit-llvm",
                                cl::desc("Emit LLVM IR instead of metallib"),
                                cl::init(false));
 
+static cl::opt<bool> DumpProfile("dump-profile",
+                                  cl::desc("Dump KernelProfile facts and exit"),
+                                  cl::init(false));
+
 static cl::opt<std::string> PassNames("pass",
                                        cl::desc("Run specific pass(es), comma-separated"),
                                        cl::value_desc("name[,name,...]"),
@@ -155,6 +159,32 @@ int main(int argc, char **argv) {
         return 1;
       }
     }
+  }
+
+  // --dump-profile: compute and print KernelProfile, then exit
+  if (DumpProfile) {
+    auto &profiles = MAM.getResult<metalir::KernelProfileAnalysis>(*M);
+    for (auto &F : *M) {
+      if (F.isDeclaration()) continue;
+      auto it = profiles.find(&F);
+      if (it == profiles.end()) continue;
+      auto &f = it->second;
+      outs() << "function " << F.getName() << ":\n";
+      if (f.hasDeviceStore) outs() << "  hasDeviceStore\n";
+      if (f.hasDeviceLoad) outs() << "  hasDeviceLoad\n";
+      if (f.hasTGStore) outs() << "  hasTGStore\n";
+      if (f.hasTGLoad) outs() << "  hasTGLoad\n";
+      if (f.hasAtomics) outs() << "  hasAtomics\n";
+      if (f.hasPerThreadIndex) outs() << "  hasPerThreadIndex\n";
+      if (f.hasProgramIndex) outs() << "  hasProgramIndex\n";
+      if (f.hasNonFloatDeviceLoad) outs() << "  hasNonFloatDeviceLoad\n";
+      if (f.hasNonFloatDeviceStore) outs() << "  hasNonFloatDeviceStore\n";
+      if (f.hasStructPhi) outs() << "  hasStructPhi\n";
+      if (f.isScalarKernel()) outs() << "  => isScalarKernel\n";
+      if (f.needsTGBarriers()) outs() << "  => needsTGBarriers\n";
+      if (f.needsDeviceLoadWidening()) outs() << "  => needsDeviceLoadWidening\n";
+    }
+    return 0;
   }
 
   MPM.run(*M, MAM);
