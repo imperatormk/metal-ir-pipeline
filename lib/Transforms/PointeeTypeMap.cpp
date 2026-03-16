@@ -16,30 +16,37 @@ AnalysisKey PointeeTypeAnalysis::Key;
 // then falls back to GEP source type and atomic intrinsic name inference.
 
 Type *PointeeTypeMap::inferFromUsage(Value *ptr) {
-  // Primary: load/store types via recursive user walk (shared with TG passes)
-  if (Type *T = inferElementType(ptr))
-    return T;
-
-  // Fallback 1: GEP source element type
-  for (auto *U : ptr->users())
-    if (auto *GEP = dyn_cast<GetElementPtrInst>(U))
-      return GEP->getSourceElementType();
-
-  // Fallback 2: atomic intrinsic name → type
+  // Prioritize load/store types over GEP source types.
+  // Recurse through GEP chains to find the ultimate store/load type.
+  Type *gepType = nullptr;
+  Type *atomicType = nullptr;
   for (auto *U : ptr->users()) {
+    if (auto *LI = dyn_cast<LoadInst>(U))
+      return LI->getType();
+    if (auto *SI = dyn_cast<StoreInst>(U)) {
+      if (SI->getPointerOperand() == ptr)
+        return SI->getValueOperand()->getType();
+    }
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      if (Type *T = inferFromUsage(GEP))
+        return T;
+      if (!gepType)
+        gepType = GEP->getSourceElementType();
+    }
     if (auto *CI = dyn_cast<CallInst>(U)) {
       if (auto *Callee = CI->getCalledFunction()) {
         StringRef name = Callee->getName();
-        if (name.starts_with("air.atomic.")) {
+        if (name.starts_with("air.atomic.") && !atomicType) {
           if (name.ends_with(".i32"))
-            return Type::getInt32Ty(ptr->getContext());
-          if (name.ends_with(".f32"))
-            return Type::getFloatTy(ptr->getContext());
+            atomicType = Type::getInt32Ty(ptr->getContext());
+          else if (name.ends_with(".f32"))
+            atomicType = Type::getFloatTy(ptr->getContext());
         }
       }
     }
   }
-  return nullptr;
+  if (gepType) return gepType;
+  return atomicType;
 }
 
 // ── Collapse device pointers to float* ───────────────────────────────────

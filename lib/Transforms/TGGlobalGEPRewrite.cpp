@@ -601,18 +601,6 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
   collectTGByteGlobals(M, byteGlobals);
   collectTGTypedGlobals(M, mmaGlobals);
 
-  // Pre-pass: scalarize <1 x T> on ALL byte globals before splitting.
-  // splitMixedByteGlobals checks isIntegerTy()/isFloatingPointTy() which
-  // don't match <1 x float>. Without this, mixed-type globals with vec1
-  // stores (e.g., argmax: <1 x float> at offset 0, <1 x i32> at offset 16)
-  // aren't detected as mixed and don't get split.
-  Type *I32 = Type::getInt32Ty(M.getContext());
-  for (auto *GV : byteGlobals) {
-    expandConstantExprUsers(GV);
-    changed |= scalarizeVec1Users(GV, I32);
-  }
-  if (changed) foldExtractInsert(M);
-
   // 14a: Split mixed-type byte globals
   changed |= splitMixedByteGlobals(M, byteGlobals);
 
