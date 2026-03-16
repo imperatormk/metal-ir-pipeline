@@ -1,0 +1,2 @@
+PASS: device-loads-volatile
+CHECK: load volatile float, ptr addrspace(1)
