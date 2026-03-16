@@ -30,6 +30,7 @@ add_library(MetalIRTransforms
   NormalizeI1Pointers.cpp
   NormalizeAllocas.cpp
   PointeeTypeMap.cpp
+  KernelProfile.cpp
 )
 
 target_link_libraries(MetalIRTransforms ${llvm_libs})

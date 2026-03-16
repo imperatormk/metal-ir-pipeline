@@ -17,6 +17,7 @@
 //   bfloat16-cast-decompose, normalize-allocas
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/KernelProfile.h"
 #include "metal-ir/PointeeTypeMap.h"
 #include "metal-ir/MetallibWriter.h"
 
@@ -138,6 +139,7 @@ int main(int argc, char **argv) {
   MAM.registerPass([&] { return metalir::MMAPresenceAnalysis(); });
   MAM.registerPass([&] { return metalir::TGMemoryAnalysis(); });
   MAM.registerPass([&] { return metalir::PointeeTypeAnalysis(); });
+  MAM.registerPass([&] { return metalir::KernelProfileAnalysis(); });
 
   ModulePassManager MPM;
 

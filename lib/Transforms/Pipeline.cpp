@@ -2,6 +2,7 @@
 // Implemented passes live in their own files.
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/KernelProfile.h"
 #include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 
