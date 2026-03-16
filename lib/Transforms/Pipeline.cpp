@@ -4,6 +4,8 @@
 #include "metal-ir/Pipeline.h"
 #include "metal-ir/PassUtil.h"
 
+#include "llvm/Support/raw_ostream.h"
+
 using namespace llvm;
 
 namespace metalir {
@@ -46,61 +48,83 @@ TGMemoryBudget TGMemoryAnalysis::run(Module &M, ModuleAnalysisManager &AM) {
 
 // ── Pipeline Builder ─────────────────────────────────────────────────────
 
+// ── Postcondition wrapper ──────────────────────────────────────────────
+// Wraps a pass to verify needsRun() returns false after execution.
+// Enabled by METALIR_VERIFY=1 env var. Catches pass misordering bugs.
+
+template <typename PassT>
+struct VerifyingPass : PassInfoMixin<VerifyingPass<PassT>> {
+  PassT inner;
+  const char *passLabel;
+  VerifyingPass(PassT p, const char *n) : inner(std::move(p)), passLabel(n) {}
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+    auto PA = inner.run(M, AM);
+    if (PassT::needsRun(M))
+      errs() << "METALIR_VERIFY: " << passLabel
+             << " did not eliminate all targets\n";
+    return PA;
+  }
+};
+
 void buildMetalIRPipeline(ModulePassManager &MPM) {
   int stopAfter = -1;
   if (auto *env = getenv("METALIR_STOP_AFTER"))
     stopAfter = atoi(env);
+  bool verify = getenv("METALIR_VERIFY") != nullptr;
   int passNum = 0;
-  auto maybeAdd = [&](auto pass) {
-    if (stopAfter < 0 || passNum < stopAfter)
+  auto maybeAdd = [&](auto pass, const char *name = "") {
+    if (stopAfter >= 0 && passNum >= stopAfter) { passNum++; return; }
+    if (verify)
+      MPM.addPass(VerifyingPass(std::move(pass), name));
+    else
       MPM.addPass(std::move(pass));
     passNum++;
   };
 
   // Phase 1: Structural transforms
-  maybeAdd(InlineNonKernelFunctionsPass());
-  maybeAdd(DecomposeStructPhisPass());
-  maybeAdd(PtrPhiToI64Pass());
+  maybeAdd(InlineNonKernelFunctionsPass(), "InlineNonKernel");
+  maybeAdd(DecomposeStructPhisPass(), "DecomposeStructPhis");
+  maybeAdd(PtrPhiToI64Pass(), "PtrPhiToI64");
 
   // Phase 2: Barrier handling
-  maybeAdd(BarrierRenamePass());
-  maybeAdd(TGBarrierInsertPass());
+  maybeAdd(BarrierRenamePass(), "BarrierRename");
+  maybeAdd(TGBarrierInsertPass(), "TGBarrierInsert");
 
   // Phase 3: Instruction lowering (independent, any order)
-  maybeAdd(NaNMinMaxPass());
-  maybeAdd(LowerFNegPass());
-  maybeAdd(BitcastZeroInitPass());
-  maybeAdd(LLVMToAIRIntrinsicsPass());
-  maybeAdd(LowerIntMinMaxPass());
-  maybeAdd(SplitI64ShufflePass());
-  maybeAdd(LowerAtomicRMWPass());
+  maybeAdd(NaNMinMaxPass(), "NaNMinMax");
+  maybeAdd(LowerFNegPass(), "LowerFNeg");
+  maybeAdd(BitcastZeroInitPass(), "BitcastZeroInit");
+  maybeAdd(LLVMToAIRIntrinsicsPass(), "LLVMToAIRIntrinsics");
+  maybeAdd(LowerIntMinMaxPass(), "LowerIntMinMax");
+  maybeAdd(SplitI64ShufflePass(), "SplitI64Shuffle");
+  maybeAdd(LowerAtomicRMWPass(), "LowerAtomicRMW");
 
   // Phase 4: TG memory management (strict order)
-  maybeAdd(TGGlobalDeadElimPass());
-  maybeAdd(TGGlobalCoalescePass());
-  maybeAdd(TGGlobalGEPRewritePass());
+  maybeAdd(TGGlobalDeadElimPass(), "TGGlobalDeadElim");
+  maybeAdd(TGGlobalCoalescePass(), "TGGlobalCoalesce");
+  maybeAdd(TGGlobalGEPRewritePass(), "TGGlobalGEPRewrite");
 
   // Phase 5: Type system
-  maybeAdd(InferTypedPointersPass());
-  maybeAdd(MMATypedPointersPass());
+  maybeAdd(InferTypedPointersPass(), "InferTypedPointers");
+  maybeAdd(MMATypedPointersPass(), "MMATypedPointers");
 
   // Phase 6: Kernel ABI
-  maybeAdd(ScalarBufferPackingPass());
-  maybeAdd(ScalarStoreGuardPass());
-  maybeAdd(AIRSystemValuesPass());
+  maybeAdd(ScalarBufferPackingPass(), "ScalarBufferPacking");
+  maybeAdd(ScalarStoreGuardPass(), "ScalarStoreGuard");
+  maybeAdd(AIRSystemValuesPass(), "AIRSystemValues");
 
   // Phase 7: Pre-serialization normalization (part 1)
-  maybeAdd(NormalizeI1PointersPass());
+  maybeAdd(NormalizeI1PointersPass(), "NormalizeI1Pointers");
 
   // Phase 8: Device memory fixups
-  maybeAdd(DeviceLoadsVolatilePass());
-  maybeAdd(WidenDeviceLoadsPass());
+  maybeAdd(DeviceLoadsVolatilePass(), "DeviceLoadsVolatile");
+  maybeAdd(WidenDeviceLoadsPass(), "WidenDeviceLoads");
 
   // Phase 9: Cast decomposition (after WidenDeviceLoads so trunc→sext folds)
-  maybeAdd(BFloat16CastDecomposePass());
+  maybeAdd(BFloat16CastDecomposePass(), "BFloat16CastDecompose");
 
   // Phase 10: Pre-serialization normalization (part 2, after widening)
-  maybeAdd(NormalizeAllocasPass());
+  maybeAdd(NormalizeAllocasPass(), "NormalizeAllocas");
 }
 
 // ── Stubs — passes not yet ported ────────────────────────────────────────
