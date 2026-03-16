@@ -39,13 +39,11 @@ static CallInst *createBarrier(IRBuilder<> &B, Module &M) {
 }
 
 bool TGBarrierInsertPass::needsRun(Module &M) {
-  // Needed if there are TG stores
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB)
-        if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == AS::Threadgroup)
-            return true;
+        if (isTGStore(&I))
+          return true;
   return false;
 }
 
@@ -60,12 +58,8 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
     SmallPtrSet<BasicBlock *, 8> tgStoreBlocks, tgLoadBlocks;
     for (auto &BB : F) {
       for (auto &I : BB) {
-        if (auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerAddressSpace() == AS::Threadgroup)
-            tgStoreBlocks.insert(&BB);
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == AS::Threadgroup)
-            tgLoadBlocks.insert(&BB);
+        if (isTGStore(&I)) tgStoreBlocks.insert(&BB);
+        if (isTGLoad(&I)) tgLoadBlocks.insert(&BB);
       }
     }
     if (tgStoreBlocks.empty()) continue;
@@ -85,9 +79,7 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
       if (!tgStoreBlocks.count(&BB) || condTargets.count(&BB))
         continue;
       for (auto it = BB.begin(); it != BB.end(); ++it) {
-        auto *SI = dyn_cast<StoreInst>(&*it);
-        if (!SI || SI->getPointerAddressSpace() != AS::Threadgroup)
-          continue;
+        if (!isTGStore(&*it)) continue;
         // Check if already preceded by barrier
         if (it != BB.begin()) {
           auto prev = std::prev(it);
@@ -130,9 +122,7 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
       // Find the last TG load in this block
       Instruction *lastTGLoad = nullptr;
       for (auto &I : BB) {
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->getPointerAddressSpace() == AS::Threadgroup)
-            lastTGLoad = &I;
+        if (isTGLoad(&I)) lastTGLoad = &I;
       }
       if (!lastTGLoad) continue;
 

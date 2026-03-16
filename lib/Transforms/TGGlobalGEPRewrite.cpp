@@ -316,12 +316,7 @@ static bool retypeByteGlobals(Module &M) {
   Type *I32 = Type::getInt32Ty(Ctx);
 
   SmallVector<GlobalVariable *, 4> byteGlobals;
-  for (auto &GV : M.globals()) {
-    if (GV.getAddressSpace() != AS::Threadgroup) continue;
-    auto *AT = dyn_cast<ArrayType>(GV.getValueType());
-    if (AT && AT->getElementType()->isIntegerTy(8))
-      byteGlobals.push_back(&GV);
-  }
+  collectTGByteGlobals(M, byteGlobals);
 
   for (auto *GV : byteGlobals) {
     expandConstantExprUsers(GV);
@@ -421,12 +416,7 @@ static bool retypeByteGlobals(Module &M) {
 
   // Strategy C: split remaining byte globals at constant offsets + retype
   SmallVector<GlobalVariable *, 4> remaining;
-  for (auto &GV : M.globals()) {
-    if (GV.getAddressSpace() != AS::Threadgroup) continue;
-    auto *AT = dyn_cast<ArrayType>(GV.getValueType());
-    if (AT && AT->getElementType()->isIntegerTy(8))
-      remaining.push_back(&GV);
-  }
+  collectTGByteGlobals(M, remaining);
 
   for (auto *GV : remaining) {
     expandConstantExprUsers(GV);
@@ -608,15 +598,8 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
   // Collect byte and MMA globals
   SmallVector<GlobalVariable *, 4> byteGlobals;
   SmallVector<GlobalVariable *, 4> mmaGlobals;
-  for (auto &GV : M.globals()) {
-    if (GV.getAddressSpace() != AS::Threadgroup) continue;
-    auto *AT = dyn_cast<ArrayType>(GV.getValueType());
-    if (!AT) continue;
-    if (AT->getElementType()->isIntegerTy(8))
-      byteGlobals.push_back(&GV);
-    else
-      mmaGlobals.push_back(&GV);
-  }
+  collectTGByteGlobals(M, byteGlobals);
+  collectTGTypedGlobals(M, mmaGlobals);
 
   // 14a: Split mixed-type byte globals
   changed |= splitMixedByteGlobals(M, byteGlobals);

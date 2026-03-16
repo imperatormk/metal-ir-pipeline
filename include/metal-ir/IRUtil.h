@@ -5,6 +5,7 @@
 /// These eliminate duplicated patterns across TGGlobalGEPRewrite,
 /// TGGlobalCoalesce, TGBarrierInsert, NormalizeAllocas, etc.
 
+#include "metal-ir/MetalConstraints.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -13,22 +14,85 @@
 
 namespace metalir {
 
-// ── Address space checks ──────────────────────────────────────────────────
-// V->getType()->getPointerAddressSpace() == N appears in 15+ passes.
+// ── Pointer address space checks ──────────────────────────────────────────
 
 inline bool isDevicePtr(llvm::Value *V) {
   return V->getType()->isPointerTy() &&
-         V->getType()->getPointerAddressSpace() == 1;
+         V->getType()->getPointerAddressSpace() == AS::Device;
 }
 
 inline bool isTGPtr(llvm::Value *V) {
   return V->getType()->isPointerTy() &&
-         V->getType()->getPointerAddressSpace() == 3;
+         V->getType()->getPointerAddressSpace() == AS::Threadgroup;
 }
 
 inline bool isConstPtr(llvm::Value *V) {
   return V->getType()->isPointerTy() &&
-         V->getType()->getPointerAddressSpace() == 2;
+         V->getType()->getPointerAddressSpace() == AS::Constant;
+}
+
+// ── Instruction-level address space checks ────────────────────────────────
+// Eliminate the `dyn_cast<StoreInst> + getPointerAddressSpace()` pattern
+// that appears in TGBarrierInsert, DeviceLoadsVolatile, WidenDeviceLoads, etc.
+
+inline bool isTGStore(llvm::Instruction *I) {
+  if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(I))
+    return SI->getPointerAddressSpace() == AS::Threadgroup;
+  return false;
+}
+
+inline bool isTGLoad(llvm::Instruction *I) {
+  if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(I))
+    return LI->getPointerAddressSpace() == AS::Threadgroup;
+  return false;
+}
+
+inline bool isDeviceStore(llvm::Instruction *I) {
+  if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(I))
+    return SI->getPointerAddressSpace() == AS::Device;
+  return false;
+}
+
+inline bool isDeviceLoad(llvm::Instruction *I) {
+  if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(I))
+    return LI->getPointerAddressSpace() == AS::Device;
+  return false;
+}
+
+// ── Module-level TG global collection ─────────────────────────────────────
+// Every TG pass (DeadElim, Coalesce, GEPRewrite, Preamble) scans globals
+// the same way. Centralize it.
+
+inline void collectTGGlobals(
+    llvm::Module &M,
+    llvm::SmallVectorImpl<llvm::GlobalVariable *> &out) {
+  for (auto &GV : M.globals())
+    if (GV.getAddressSpace() == AS::Threadgroup)
+      out.push_back(&GV);
+}
+
+/// Collect only [N x i8] byte globals in threadgroup memory.
+inline void collectTGByteGlobals(
+    llvm::Module &M,
+    llvm::SmallVectorImpl<llvm::GlobalVariable *> &out) {
+  for (auto &GV : M.globals()) {
+    if (GV.getAddressSpace() != AS::Threadgroup) continue;
+    auto *AT = llvm::dyn_cast<llvm::ArrayType>(GV.getValueType());
+    if (AT && AT->getElementType()->isIntegerTy(8))
+      out.push_back(&GV);
+  }
+}
+
+/// Collect typed (non-i8) array globals in threadgroup memory.
+inline void collectTGTypedGlobals(
+    llvm::Module &M,
+    llvm::SmallVectorImpl<llvm::GlobalVariable *> &out) {
+  for (auto &GV : M.globals()) {
+    if (GV.getAddressSpace() != AS::Threadgroup) continue;
+    auto *AT = llvm::dyn_cast<llvm::ArrayType>(GV.getValueType());
+    if (AT && !AT->getElementType()->isIntegerTy(8))
+      out.push_back(&GV);
+  }
 }
 
 // ── Recursive element type inference ──────────────────────────────────────
