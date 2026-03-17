@@ -108,6 +108,20 @@ PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
     }
   }
 
+  // Phase 2b: Force float* for device pointer phi nodes.
+  // Non-float typed device pointers in phi nodes crash Metal GPU JIT.
+  {
+    Type *F32 = Type::getFloatTy(M.getContext());
+    for (auto &F : M)
+      for (auto &BB : F)
+        for (auto &I : BB) {
+          auto *PN = dyn_cast<PHINode>(&I);
+          if (!PN || !PN->getType()->isPointerTy()) continue;
+          if (PN->getType()->getPointerAddressSpace() != AS::Device) continue;
+          ptm.set(PN, F32);
+        }
+  }
+
   // Phase 3: Global variables (TG and device)
   for (auto &GV : M.globals()) {
     if (GV.getType()->isPointerTy()) {

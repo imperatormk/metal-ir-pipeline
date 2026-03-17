@@ -20,9 +20,13 @@ bool NormalizeAllocasPass::needsRun(Module &M) {
   for (auto &F : M)
     for (auto &BB : F)
       for (auto &I : BB) {
-        if (auto *AI = dyn_cast<AllocaInst>(&I))
+        if (auto *AI = dyn_cast<AllocaInst>(&I)) {
           if (AI->getArraySize()->getType()->isIntegerTy(64))
             return true;
+          // Alloca in non-entry block: needs hoisting
+          if (&BB != &F.getEntryBlock())
+            return true;
+        }
         if (auto *BC = dyn_cast<BitCastInst>(&I))
           if (BC->getSrcTy() == BC->getDestTy())
             return true;
@@ -65,6 +69,23 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
             BO->setIsDisjoint(false);
             changed = true;
           }
+
+  // Hoist allocas from non-entry blocks to the entry block.
+  // Metal GPU JIT crashes on allocas in loop bodies.
+  for (auto &F : M) {
+    if (F.isDeclaration()) continue;
+    BasicBlock &entry = F.getEntryBlock();
+    Instruction *insertPt = &*entry.getFirstInsertionPt();
+    for (auto &BB : F) {
+      if (&BB == &entry) continue;
+      for (auto it = BB.begin(); it != BB.end();) {
+        auto *AI = dyn_cast<AllocaInst>(&*it++);
+        if (!AI) continue;
+        AI->moveBefore(insertPt->getIterator());
+        changed = true;
+      }
+    }
+  }
 
   for (auto &F : M) {
     for (auto &BB : F) {
