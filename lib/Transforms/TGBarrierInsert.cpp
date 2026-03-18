@@ -118,33 +118,39 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
       }
     }
 
-    // Strategy 3: WAR hazard — barrier between TG load and TG store
-    // When a block has a TG load and later reaches a TG store (in same
-    // block or successor) without an intervening barrier, insert one.
-    // This prevents a fast warp from overwriting TG data that a slow
-    // warp hasn't read yet (e.g., multi-reduction kernels reusing TG).
+    // Strategy 3: WAR hazard — barrier between TG load and TG store.
+    // Scan each block for TG load→TG store sequences with no barrier
+    // between them. This catches both:
+    //  a) Intra-block hazards (load and store in same block, created when
+    //     TG globals are merged post-initial-barrier-insertion)
+    //  b) Cross-block hazards (load in block, store in successor)
     for (auto &BB : F) {
       if (!tgLoadBlocks.count(&BB)) continue;
 
-      // Find the last TG load in this block
-      Instruction *lastTGLoad = nullptr;
-      for (auto &I : BB) {
-        if (isTGLoad(&I)) lastTGLoad = &I;
-      }
-      if (!lastTGLoad) continue;
-
-      // Check if there's a barrier after the last TG load in this block
-      bool hasBarrierAfterLoad = false;
-      for (auto it = lastTGLoad->getIterator(); it != BB.end(); ++it) {
-        if (isBarrierCall(&*it)) {
-          hasBarrierAfterLoad = true;
-          break;
+      // Walk the block tracking whether we've seen a TG load without
+      // a subsequent barrier. Insert barrier before any TG store that
+      // follows an unguarded TG load.
+      bool seenUnguardedLoad = false;
+      for (auto it = BB.begin(); it != BB.end(); ++it) {
+        if (isTGLoad(&*it)) {
+          seenUnguardedLoad = true;
+        } else if (isBarrierCall(&*it)) {
+          seenUnguardedLoad = false;
+        } else if (isTGStore(&*it) && seenUnguardedLoad) {
+          // WAR hazard: TG load earlier in block, no barrier before
+          // this TG store. Insert barrier to prevent fast warps from
+          // clobbering data that slow warps haven't read yet.
+          IRBuilder<> B(&*it);
+          createBarrier(B, M);
+          changed = true;
+          seenUnguardedLoad = false;
         }
       }
-      if (hasBarrierAfterLoad) continue;
 
-      // Check if any successor has a TG store (directly or via
-      // conditional branch to a TG-store block)
+      // If we exit the block with an unguarded TG load, check successors
+      // for TG stores.
+      if (!seenUnguardedLoad) continue;
+
       auto *term = BB.getTerminator();
       bool succHasTGStore = false;
       for (unsigned i = 0; i < term->getNumSuccessors(); i++) {
@@ -157,7 +163,6 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
         if (auto *succBI = dyn_cast<BranchInst>(succ->getTerminator())) {
           for (unsigned j = 0; j < succBI->getNumSuccessors(); j++) {
             if (tgStoreBlocks.count(succBI->getSuccessor(j))) {
-              // Only if no barrier in succ before the branch
               bool succHasBarrier = false;
               for (auto &SI : *succ)
                 if (isBarrierCall(&SI)) { succHasBarrier = true; break; }
