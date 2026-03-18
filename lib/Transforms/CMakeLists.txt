@@ -7,6 +7,7 @@ add_library(MetalIRTransforms
   InlineNonKernel.cpp
   DecomposeStructPhis.cpp
   PtrPhiToI64.cpp
+  PtrSelectToI64.cpp
   BarrierRename.cpp
   TGBarrierInsert.cpp
   NaNMinMax.cpp

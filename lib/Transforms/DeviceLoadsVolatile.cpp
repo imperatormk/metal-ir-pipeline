@@ -7,6 +7,12 @@
 // Fix: find back-edges (loops), collect stored device pointers,
 // mark loads from those pointers as volatile.
 //
+// Also handles cross-threadgroup synchronization via atomic CAS spin-locks:
+// when a function uses CAS atomics, device loads/stores in critical sections
+// (after lock acquire) must be volatile to prevent the GPU from reordering
+// them across the atomic boundary. Without this, threadgroup B may read
+// stale data written by threadgroup A under a spin-lock.
+//
 // Uses LLVM's DominatorTree to detect back-edges properly,
 // instead of MetalASM's index-based heuristic.
 
@@ -20,6 +26,17 @@
 
 using namespace llvm;
 namespace metalir {
+
+// Check if function contains any CAS atomic calls
+static bool hasCASAtomic(Function &F) {
+  for (auto &BB : F)
+    for (auto &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (auto *Callee = CI->getCalledFunction())
+          if (Callee->getName().contains("cmpxchg"))
+            return true;
+  return false;
+}
 
 bool DeviceLoadsVolatilePass::needsRun(Module &M) {
   for (auto &F : M) {
@@ -45,6 +62,28 @@ PreservedAnalyses DeviceLoadsVolatilePass::run(Module &M,
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
+
+    // If the function uses CAS atomics (spin-lock pattern), mark ALL
+    // device loads and stores as volatile to prevent GPU reordering
+    // across the atomic boundary.
+    if (hasCASAtomic(F)) {
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          if (auto *LdI = dyn_cast<LoadInst>(&I)) {
+            if (isDeviceLoad(&I) && !LdI->isVolatile()) {
+              LdI->setVolatile(true);
+              changed = true;
+            }
+          } else if (auto *StI = dyn_cast<StoreInst>(&I)) {
+            if (isDeviceStore(&I) && !StI->isVolatile()) {
+              StI->setVolatile(true);
+              changed = true;
+            }
+          }
+        }
+      }
+      continue;
+    }
 
     // Early exit: no device store+load pattern means no volatile marking needed
     auto it = profiles.find(&F);

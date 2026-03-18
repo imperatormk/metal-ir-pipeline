@@ -38,6 +38,12 @@ struct PtrPhiToI64Pass : llvm::PassInfoMixin<PtrPhiToI64Pass> {
   static bool needsRun(llvm::Module &M);
 };
 
+// Pass 2b: Pointer selects crash GPU JIT — convert to i64 selects.
+struct PtrSelectToI64Pass : llvm::PassInfoMixin<PtrSelectToI64Pass> {
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);
+  static bool needsRun(llvm::Module &M);
+};
+
 // Pass 3: Rename air.threadgroup.barrier → air.wg.barrier.
 struct BarrierRenamePass : llvm::PassInfoMixin<BarrierRenamePass> {
   llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);

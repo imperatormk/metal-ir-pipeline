@@ -590,6 +590,60 @@ static bool insertPreambleGEPs(Module &M) {
   return changed;
 }
 
+// ── 14e: Fix residual i8 GEPs on typed TG pointers ─────────────────────
+// After 14a-14d, some i8-source GEPs may remain on pointers derived from
+// typed (non-i8) TG GEPs.  Example:
+//   %p = gep float, @tg_global, i64 256    ; float-typed base pointer
+//   %q = gep i8,    %p,         i32 %off   ; byte-offset on float* -- BAD
+// Metal GPU JIT cannot handle this type mismatch. Convert the i8 GEP to
+// use the same element type as the producing GEP.
+static bool fixResidualI8GEPs(Module &M) {
+  bool changed = false;
+  auto &DL = M.getDataLayout();
+
+  for (auto &F : M) {
+    if (F.isDeclaration()) continue;
+    SmallVector<GetElementPtrInst *, 16> i8Geps;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+          if (GEP->getSourceElementType()->isIntegerTy(8) &&
+              GEP->getPointerAddressSpace() == AS::Threadgroup) {
+            // Only fix when the pointer comes from a non-i8 typed GEP
+            auto *srcGEP = dyn_cast<GetElementPtrInst>(GEP->getPointerOperand());
+            if (srcGEP && !srcGEP->getSourceElementType()->isIntegerTy(8))
+              i8Geps.push_back(GEP);
+          }
+
+    for (auto *GEP : i8Geps) {
+      // Use the element type from the source GEP
+      auto *srcGEP = cast<GetElementPtrInst>(GEP->getPointerOperand());
+      Type *elemTy = srcGEP->getSourceElementType();
+      // For array types, get the element type
+      if (auto *AT = dyn_cast<ArrayType>(elemTy))
+        elemTy = AT->getElementType();
+      unsigned elemSize = DL.getTypeAllocSize(elemTy);
+      if (elemSize == 0 || elemSize == 1) continue;
+
+      // Convert byte index to element index
+      IRBuilder<> B(GEP);
+      Value *byteIdx = GEP->getOperand(1);
+      Value *elemIdx;
+      if (auto *CI = dyn_cast<ConstantInt>(byteIdx))
+        elemIdx = ConstantInt::get(CI->getType(), CI->getZExtValue() / elemSize);
+      else
+        elemIdx = B.CreateUDiv(byteIdx,
+                    ConstantInt::get(byteIdx->getType(), elemSize));
+      auto *newGEP = B.CreateInBoundsGEP(elemTy, GEP->getPointerOperand(),
+                                           elemIdx, GEP->getName());
+      GEP->replaceAllUsesWith(newGEP);
+      GEP->eraseFromParent();
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 // ── Main pass: orchestrate sub-passes ──────────────────────────────────
 PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
                                                ModuleAnalysisManager &AM) {
@@ -612,6 +666,9 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
 
   // 14d: Insert preamble GEPs
   changed |= insertPreambleGEPs(M);
+
+  // 14e: Fix residual i8 GEPs on typed TG pointers
+  changed |= fixResidualI8GEPs(M);
 
   return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

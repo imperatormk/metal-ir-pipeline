@@ -14,6 +14,7 @@
 #include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PointeeTypeMap.h"
 
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 
@@ -76,6 +77,68 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
           PTM.set(&I, GEP->getResultElementType());
         }
       }
+    }
+  }
+
+  // Phase 1b: Atomic intrinsic call site pointer fixup.
+  //
+  // Metal GPU JIT requires typed pointer types in bitcode to match the
+  // intrinsic's expected type. For air.atomic.global.cmpxchg.weak.i32,
+  // the device pointer param must be i32* — but the MLIR lowering often
+  // passes a float* GEP result (the original buffer stores floats, the
+  // CAS operates on i32 bitcasts). The reference Metal compiler inserts
+  // an explicit `bitcast float* to i32*` before the call.
+  //
+  // In opaque-pointer LLVM IR, we can't insert ptr-to-ptr bitcasts
+  // (LLVM removes them as no-ops), so we insert ptrtoint+inttoptr to
+  // create a new SSA value, then set its PTM entry to the expected type.
+  {
+    Type *I32 = Type::getInt32Ty(M.getContext());
+    Type *I64 = Type::getInt64Ty(M.getContext());
+    SmallVector<std::pair<CallInst *, unsigned>, 8> fixups;
+
+    for (auto &F : M) {
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CI = dyn_cast<CallInst>(&I);
+          if (!CI || !CI->getCalledFunction()) continue;
+          StringRef name = CI->getCalledFunction()->getName();
+          if (!name.starts_with("air.atomic.global.")) continue;
+
+          // Determine expected pointee type from intrinsic name suffix
+          Type *expectedPointee = nullptr;
+          if (name.ends_with(".i32"))
+            expectedPointee = I32;
+          else if (name.ends_with(".f32"))
+            expectedPointee = F32;
+          else
+            continue;
+
+          // Check device pointer arg (param 0 for all air.atomic.global.*)
+          Value *ptrArg = CI->getArgOperand(0);
+          if (!ptrArg->getType()->isPointerTy()) continue;
+          unsigned addrSpace = ptrArg->getType()->getPointerAddressSpace();
+          if (addrSpace != AS::Device && addrSpace != AS::Threadgroup) continue;
+
+          Type *currentPointee = PTM.get(ptrArg);
+          if (currentPointee == expectedPointee) continue;
+
+          fixups.push_back({CI, 0});
+        }
+      }
+    }
+
+    for (auto &[CI, argIdx] : fixups) {
+      StringRef name = CI->getCalledFunction()->getName();
+      Type *expectedPointee = name.ends_with(".i32") ? I32 : F32;
+      Value *ptrArg = CI->getArgOperand(argIdx);
+      unsigned addrSpace = ptrArg->getType()->getPointerAddressSpace();
+
+      IRBuilder<> B(CI);
+      Value *asInt = B.CreatePtrToInt(ptrArg, I64);
+      Value *newPtr = B.CreateIntToPtr(asInt, PointerType::get(M.getContext(), addrSpace));
+      CI->setArgOperand(argIdx, newPtr);
+      PTM.set(newPtr, expectedPointee);
     }
   }
 

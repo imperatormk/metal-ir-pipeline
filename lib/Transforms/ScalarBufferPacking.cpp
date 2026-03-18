@@ -303,18 +303,42 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
       } else {
         unsigned scalarBits = sp.scalarType->getScalarSizeInBits();
         if (sp.scalarType->isPointerTy()) {
-          // Pointer: load as i64 (ptrtoint), then inttoptr
+          // Pointer: load as two i32 words (lo, hi), combine to i64, then inttoptr
           auto *rawLoad = new LoadInst(bufElemTy, gep, name + "_raw", false, Align(4));
           preamble.push_back(rawLoad);
-          auto *asI32 = CastInst::Create(Instruction::BitCast, rawLoad,
+          auto *loI32 = CastInst::Create(Instruction::BitCast, rawLoad,
                                           Type::getInt32Ty(M.getContext()),
-                                          name + "_i32");
-          preamble.push_back(asI32);
-          auto *asI64 = CastInst::Create(Instruction::ZExt, asI32,
+                                          name + "_lo32");
+          preamble.push_back(loI32);
+          auto *loI64 = CastInst::Create(Instruction::ZExt, loI32,
                                           Type::getInt64Ty(M.getContext()),
-                                          name + "_i64");
-          preamble.push_back(asI64);
-          auto *ptr = CastInst::Create(Instruction::IntToPtr, asI64,
+                                          name + "_lo64");
+          preamble.push_back(loI64);
+
+          auto *gepHi = GetElementPtrInst::CreateInBounds(
+              bufElemTy, bufArg,
+              ConstantInt::get(Type::getInt64Ty(M.getContext()), gepIdx + 1),
+              name + "_gep_hi");
+          preamble.push_back(gepHi);
+          auto *hiRaw = new LoadInst(bufElemTy, gepHi, name + "_hi_raw", false, Align(4));
+          preamble.push_back(hiRaw);
+          auto *hiI32 = CastInst::Create(Instruction::BitCast, hiRaw,
+                                          Type::getInt32Ty(M.getContext()),
+                                          name + "_hi32");
+          preamble.push_back(hiI32);
+          auto *hiI64 = CastInst::Create(Instruction::ZExt, hiI32,
+                                          Type::getInt64Ty(M.getContext()),
+                                          name + "_hi64");
+          preamble.push_back(hiI64);
+          auto *shifted = BinaryOperator::Create(
+              Instruction::Shl, hiI64,
+              ConstantInt::get(Type::getInt64Ty(M.getContext()), 32),
+              name + "_shift");
+          preamble.push_back(shifted);
+          auto *combined = BinaryOperator::Create(
+              Instruction::Or, shifted, loI64, name + "_i64");
+          preamble.push_back(combined);
+          auto *ptr = CastInst::Create(Instruction::IntToPtr, combined,
                                         sp.scalarType, name);
           preamble.push_back(ptr);
           loaded = ptr;
@@ -338,17 +362,56 @@ PreservedAnalyses ScalarBufferPackingPass::run(Module &M,
           // i32 → target type
           if (sp.scalarType->isIntegerTy()) {
             unsigned targetBits = sp.scalarType->getIntegerBitWidth();
-            Instruction::CastOps op;
-            if (targetBits < 32)
-              op = Instruction::Trunc;
-            else if (targetBits > 32)
-              op = Instruction::ZExt;
-            else
-              op = Instruction::BitCast;
-            auto *conv = CastInst::Create(op, asI32,
-                                            sp.scalarType, name);
-            preamble.push_back(conv);
-            loaded = conv;
+            if (targetBits > 32) {
+              // i64 scalars: load two float values (lo, hi), bitcast to i32,
+              // zext to i64, combine with (hi << 32) | lo.
+              // Can't load i64 directly from float* (Metal typed pointer crash).
+
+              // rawLoad is lo word, asI32 is lo as i32 — keep them
+              auto *loI32 = asI32;
+              auto *loI64 = CastInst::Create(Instruction::ZExt, loI32,
+                                              Type::getInt64Ty(M.getContext()),
+                                              name + "_lo64");
+              preamble.push_back(loI64);
+
+              // Load hi word from gepIdx+1
+              auto *gepHi = GetElementPtrInst::CreateInBounds(
+                  bufElemTy, bufArg,
+                  ConstantInt::get(Type::getInt64Ty(M.getContext()), gepIdx + 1),
+                  name + "_gep_hi");
+              preamble.push_back(gepHi);
+              auto *hiRaw = new LoadInst(bufElemTy, gepHi, name + "_hi_raw", false, Align(4));
+              preamble.push_back(hiRaw);
+              auto *hiI32 = CastInst::Create(Instruction::BitCast, hiRaw,
+                                              Type::getInt32Ty(M.getContext()),
+                                              name + "_hi32");
+              preamble.push_back(hiI32);
+              auto *hiI64 = CastInst::Create(Instruction::ZExt, hiI32,
+                                              Type::getInt64Ty(M.getContext()),
+                                              name + "_hi64");
+              preamble.push_back(hiI64);
+
+              // Combine: (hi << 32) | lo
+              auto *shifted = BinaryOperator::Create(
+                  Instruction::Shl, hiI64,
+                  ConstantInt::get(Type::getInt64Ty(M.getContext()), 32),
+                  name + "_shift");
+              preamble.push_back(shifted);
+              auto *combined = BinaryOperator::Create(
+                  Instruction::Or, shifted, loI64, name);
+              preamble.push_back(combined);
+              loaded = combined;
+            } else {
+              Instruction::CastOps op;
+              if (targetBits < 32)
+                op = Instruction::Trunc;
+              else
+                op = Instruction::BitCast;
+              auto *conv = CastInst::Create(op, asI32,
+                                              sp.scalarType, name);
+              preamble.push_back(conv);
+              loaded = conv;
+            }
           } else if (sp.scalarType->isHalfTy() || sp.scalarType->isBFloatTy()) {
             auto *asI16 = CastInst::Create(Instruction::Trunc, asI32,
                                             Type::getInt16Ty(M.getContext()),

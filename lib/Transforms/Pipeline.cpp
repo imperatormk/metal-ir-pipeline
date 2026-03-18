@@ -6,6 +6,8 @@
 #include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PassUtil.h"
 
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
@@ -87,6 +89,7 @@ void buildMetalIRPipeline(ModulePassManager &MPM) {
   maybeAdd(InlineNonKernelFunctionsPass(), "InlineNonKernel");
   maybeAdd(DecomposeStructPhisPass(), "DecomposeStructPhis");
   maybeAdd(PtrPhiToI64Pass(), "PtrPhiToI64");
+  maybeAdd(PtrSelectToI64Pass(), "PtrSelectToI64");
 
   // Phase 2: Barrier handling
   maybeAdd(BarrierRenamePass(), "BarrierRename");
@@ -126,6 +129,36 @@ void buildMetalIRPipeline(ModulePassManager &MPM) {
 
   // Phase 10: Pre-serialization normalization (part 2, after widening)
   maybeAdd(NormalizeAllocasPass(), "NormalizeAllocas");
+
+  // Phase 11: Final sanitization — replace poison with undef and strip dead
+  // LLVM intrinsic declarations. Must run AFTER all lowering passes.
+  {
+    struct SanitizeForMetalPass : PassInfoMixin<SanitizeForMetalPass> {
+      PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+        bool changed = false;
+        // Replace poison values with undef
+        for (auto &F : M)
+          for (auto &BB : F)
+            for (auto &I : BB)
+              for (unsigned i = 0; i < I.getNumOperands(); i++)
+                if (isa<PoisonValue>(I.getOperand(i))) {
+                  I.setOperand(i, UndefValue::get(I.getOperand(i)->getType()));
+                  changed = true;
+                }
+        // Strip dead llvm.* intrinsic declarations (left over from lowering)
+        SmallVector<Function *, 4> deadDecls;
+        for (auto &F : M)
+          if (F.isDeclaration() && F.use_empty() && F.isIntrinsic())
+            deadDecls.push_back(&F);
+        for (auto *F : deadDecls) {
+          F->eraseFromParent();
+          changed = true;
+        }
+        return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+      }
+    };
+    MPM.addPass(SanitizeForMetalPass());
+  }
 }
 
 // ── Stubs — passes not yet ported ────────────────────────────────────────

@@ -18,8 +18,12 @@ AnalysisKey PointeeTypeAnalysis::Key;
 Type *PointeeTypeMap::inferFromUsage(Value *ptr) {
   // Prioritize load/store types over GEP source types.
   // Recurse through GEP chains to find the ultimate store/load type.
+  // NOTE: Do NOT follow atomic intrinsic calls through GEP chains.
+  // When a float buffer pointer goes through a float GEP to a CAS call
+  // (which operates on i32), the GEP source type (float) must win.
+  // The atomic type mismatch is resolved separately by
+  // InferTypedPointersPass Phase 1b (ptrtoint+inttoptr insertion).
   Type *gepType = nullptr;
-  Type *atomicType = nullptr;
   for (auto *U : ptr->users()) {
     if (auto *LI = dyn_cast<LoadInst>(U))
       return LI->getType();
@@ -36,17 +40,20 @@ Type *PointeeTypeMap::inferFromUsage(Value *ptr) {
     if (auto *CI = dyn_cast<CallInst>(U)) {
       if (auto *Callee = CI->getCalledFunction()) {
         StringRef name = Callee->getName();
-        if (name.starts_with("air.atomic.") && !atomicType) {
+        // Only use atomic type if the pointer is NOT a GEP result.
+        // GEP results must keep their source element type for consistency;
+        // the atomic type mismatch is handled by inserting ptrtoint+inttoptr.
+        if (!isa<GetElementPtrInst>(ptr) &&
+            name.starts_with("air.atomic.")) {
           if (name.ends_with(".i32"))
-            atomicType = Type::getInt32Ty(ptr->getContext());
+            return Type::getInt32Ty(ptr->getContext());
           else if (name.ends_with(".f32"))
-            atomicType = Type::getFloatTy(ptr->getContext());
+            return Type::getFloatTy(ptr->getContext());
         }
       }
     }
   }
-  if (gepType) return gepType;
-  return atomicType;
+  return gepType;
 }
 
 // ── Collapse device pointers to float* ───────────────────────────────────

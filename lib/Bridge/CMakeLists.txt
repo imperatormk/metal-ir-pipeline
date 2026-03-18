@@ -27,4 +27,5 @@ set_target_properties(MetalIRBridge PROPERTIES
 target_link_options(MetalIRBridge PRIVATE
   -Wl,-exported_symbol,_metalir_compile
   -Wl,-exported_symbol,_metalir_free
+  -Wl,-exported_symbol,_metalir_tg_memory_bytes
 )

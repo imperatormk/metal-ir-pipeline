@@ -106,6 +106,23 @@ void *metalir_compile(const char *llText, uint64_t *outLen,
   return result;
 }
 
+/// Compute total threadgroup memory (addrspace 3) in bytes for a module.
+__attribute__((visibility("default")))
+uint64_t metalir_tg_memory_bytes(const char *llText) {
+  LLVMContext Ctx;
+  SMDiagnostic Err;
+  auto Buf = MemoryBuffer::getMemBuffer(llText, "triton_kernel");
+  auto M = parseIR(*Buf, Err, Ctx);
+  if (!M) return 0;
+
+  auto &DL = M->getDataLayout();
+  uint64_t total = 0;
+  for (auto &GV : M->globals())
+    if (GV.getAddressSpace() == 3)  // threadgroup
+      total += DL.getTypeAllocSize(GV.getValueType());
+  return total;
+}
+
 __attribute__((visibility("default")))
 void metalir_free(void *ptr) { free(ptr); }
 
