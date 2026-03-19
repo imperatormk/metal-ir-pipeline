@@ -97,6 +97,10 @@ static constexpr const char *kMMALoad =
     "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
 static constexpr const char *kMMAStore =
     "air.simdgroup_matrix_8x8_store.v64f32.p3f32";
+static constexpr const char *kMMALoadDev =
+    "air.simdgroup_matrix_8x8_load.v64f32.p1f32";
+static constexpr const char *kMMAStoreDev =
+    "air.simdgroup_matrix_8x8_store.v64f32.p1f32";
 
 PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
                                          ModuleAnalysisManager &AM) {
@@ -178,14 +182,28 @@ PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
             !ptm.has(&Arg))
           ptm.set(&Arg, F32);
 
-    // MMA declaration params → float*
-    for (auto &F : M) {
-      if (!F.isDeclaration()) continue;
-      StringRef name = F.getName();
-      if (name == kMMALoad || name == kMMAStore)
-        for (auto &Arg : F.args())
-          if (Arg.getType()->isPointerTy())
-            ptm.set(&Arg, F32);
+    // MMA declaration params → typed pointer (float*/half*/bfloat*)
+    {
+      Type *F16 = Type::getHalfTy(M.getContext());
+      Type *BF16 = Type::getBFloatTy(M.getContext());
+      for (auto &F : M) {
+        if (!F.isDeclaration()) continue;
+        StringRef name = F.getName();
+        Type *ptrPointee = nullptr;
+        if (name == kMMALoad || name == kMMAStore ||
+            name == kMMALoadDev || name == kMMAStoreDev)
+          ptrPointee = F32;
+        else if (name.contains("p1f16") &&
+                 name.starts_with("air.simdgroup_matrix_8x8_"))
+          ptrPointee = F16;
+        else if (name.contains("p1bf16") &&
+                 name.starts_with("air.simdgroup_matrix_8x8_"))
+          ptrPointee = BF16;
+        if (ptrPointee)
+          for (auto &Arg : F.args())
+            if (Arg.getType()->isPointerTy())
+              ptm.set(&Arg, ptrPointee);
+      }
     }
 
     // Kernel device pointer args → float*
@@ -196,17 +214,28 @@ PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
               Arg.getType()->getPointerAddressSpace() == AS::Device)
             ptm.set(&Arg, F32);
 
-    // MMA call site pointer operands → float*
+    // MMA call site pointer operands → typed pointer
     for (auto &F : M)
       for (auto &BB : F)
         for (auto &I : BB) {
           auto *CI = dyn_cast<CallInst>(&I);
           if (!CI || !CI->getCalledFunction()) continue;
           StringRef name = CI->getCalledFunction()->getName();
-          if (name == kMMALoad || name == kMMAStore)
+          if (!name.starts_with("air.simdgroup_matrix_8x8_")) continue;
+          Type *ptrPointee = nullptr;
+          if (name == kMMALoad || name == kMMAStore ||
+              name == kMMALoadDev || name == kMMAStoreDev)
+            ptrPointee = F32;
+          else if (name.contains("p1f16"))
+            ptrPointee = Type::getHalfTy(M.getContext());
+          else if (name.contains("p1bf16"))
+            ptrPointee = Type::getBFloatTy(M.getContext());
+          else if (name.contains("p3f32"))
+            ptrPointee = F32;
+          if (ptrPointee)
             for (unsigned i = 0; i < CI->arg_size(); i++)
               if (CI->getArgOperand(i)->getType()->isPointerTy())
-                ptm.set(CI->getArgOperand(i), F32);
+                ptm.set(CI->getArgOperand(i), ptrPointee);
         }
   }
 

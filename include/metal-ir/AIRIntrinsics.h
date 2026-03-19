@@ -113,6 +113,16 @@ inline std::string atomicName(AtomicLocality loc, AtomicOp op, AtomicType ty) {
   return name;
 }
 
+// ── MMA intrinsic names ──────────────────────────────────────────────
+
+// Threadgroup memory MMA (addrspace 3)
+constexpr const char *kMMALoadTG = "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
+constexpr const char *kMMAStoreTG = "air.simdgroup_matrix_8x8_store.v64f32.p3f32";
+
+// Device memory MMA (addrspace 1) — direct loads/stores, no TG roundtrip
+constexpr const char *kMMALoadDevice = "air.simdgroup_matrix_8x8_load.v64f32.p1f32";
+constexpr const char *kMMAStoreDevice = "air.simdgroup_matrix_8x8_store.v64f32.p1f32";
+
 // ── Metadata string constants ────────────────────────────────────────
 
 constexpr const char *kMDBuffer = "air.buffer";

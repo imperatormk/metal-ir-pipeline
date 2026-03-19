@@ -24,6 +24,8 @@ namespace metalir {
 
 static constexpr const char *kMMALoad = "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
 static constexpr const char *kMMAStore = "air.simdgroup_matrix_8x8_store.v64f32.p3f32";
+static constexpr const char *kMMALoadDev = "air.simdgroup_matrix_8x8_load.v64f32.p1f32";
+static constexpr const char *kMMAStoreDev = "air.simdgroup_matrix_8x8_store.v64f32.p1f32";
 
 bool InferTypedPointersPass::needsRun(Module &M) {
   // Always useful to run — populates PointeeTypeMap for bitcode emission
@@ -163,14 +165,29 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
 
   // Phase 5: MMA-specific overrides (formerly MMATypedPointersPass)
   if (constraints.hasMMA) {
-    // MMA load/store declaration params → float*
-    for (auto &F : M) {
-      if (!F.isDeclaration()) continue;
-      StringRef name = F.getName();
-      if (name == kMMALoad || name == kMMAStore) {
-        for (auto &Arg : F.args())
-          if (Arg.getType()->isPointerTy())
-            PTM.set(&Arg, F32);
+    // MMA load/store declaration params → typed pointer.
+    // p3f32/p1f32 variants get float*, p1f16 variants get half*.
+    {
+      Type *F16 = Type::getHalfTy(M.getContext());
+      Type *BF16 = Type::getBFloatTy(M.getContext());
+      for (auto &F : M) {
+        if (!F.isDeclaration()) continue;
+        StringRef name = F.getName();
+        Type *ptrPointee = nullptr;
+        if (name == kMMALoad || name == kMMAStore ||
+            name == kMMALoadDev || name == kMMAStoreDev)
+          ptrPointee = F32;
+        else if (name.contains("p1f16") &&
+                 name.starts_with("air.simdgroup_matrix_8x8_"))
+          ptrPointee = F16;
+        else if (name.contains("p1bf16") &&
+                 name.starts_with("air.simdgroup_matrix_8x8_"))
+          ptrPointee = BF16;
+        if (ptrPointee) {
+          for (auto &Arg : F.args())
+            if (Arg.getType()->isPointerTy())
+              PTM.set(&Arg, ptrPointee);
+        }
       }
     }
 
@@ -183,17 +200,32 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
           PTM.set(&Arg, F32);
     }
 
-    // MMA call site pointer operands → float*
-    for (auto &F : M) {
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          auto *CI = dyn_cast<CallInst>(&I);
-          if (!CI || !CI->getCalledFunction()) continue;
-          StringRef name = CI->getCalledFunction()->getName();
-          if (name == kMMALoad || name == kMMAStore)
-            for (unsigned i = 0; i < CI->arg_size(); i++)
-              if (CI->getArgOperand(i)->getType()->isPointerTy())
-                PTM.set(CI->getArgOperand(i), F32);
+    // MMA call site pointer operands → appropriate type
+    {
+      Type *F16 = Type::getHalfTy(M.getContext());
+      Type *BF16 = Type::getBFloatTy(M.getContext());
+      for (auto &F : M) {
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *CI = dyn_cast<CallInst>(&I);
+            if (!CI || !CI->getCalledFunction()) continue;
+            StringRef name = CI->getCalledFunction()->getName();
+            if (!name.starts_with("air.simdgroup_matrix_8x8_")) continue;
+            Type *ptrPointee = nullptr;
+            if (name == kMMALoad || name == kMMAStore ||
+                name == kMMALoadDev || name == kMMAStoreDev)
+              ptrPointee = F32;
+            else if (name.contains("p1f16"))
+              ptrPointee = F16;
+            else if (name.contains("p1bf16"))
+              ptrPointee = BF16;
+            else if (name.contains("p3f32"))
+              ptrPointee = F32;
+            if (ptrPointee)
+              for (unsigned i = 0; i < CI->arg_size(); i++)
+                if (CI->getArgOperand(i)->getType()->isPointerTy())
+                  PTM.set(CI->getArgOperand(i), ptrPointee);
+          }
         }
       }
     }

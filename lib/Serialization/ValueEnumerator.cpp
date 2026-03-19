@@ -178,6 +178,32 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
   for (auto &GV : M.globals())
     if (GV.hasInitializer())
       addModuleConstant(GV.getInitializer());
+
+  // Also collect sub-constants of function-level aggregate constants.
+  // ConstantsWriter emits ConstantArray/ConstantStruct/ConstantVector via
+  // AGGREGATE records that reference sub-constants by moduleConstIdx.
+  // If a function-level constant is a non-data aggregate, its sub-constants
+  // must be in the module constant table.
+  for (auto &F : M) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        for (auto &Op : I.operands()) {
+          auto *C = dyn_cast<Constant>(Op);
+          if (!C || isa<GlobalValue>(C)) continue;
+          if (isa<ConstantArray>(C) || isa<ConstantStruct>(C) ||
+              isa<ConstantVector>(C)) {
+            for (unsigned i = 0; i < C->getNumOperands(); i++)
+              if (auto *OC = dyn_cast<Constant>(C->getOperand(i)))
+                addModuleConstant(OC);
+          }
+          if (auto *CDA = dyn_cast<ConstantDataArray>(C)) {
+            for (unsigned i = 0; i < CDA->getNumElements(); i++)
+              addModuleConstant(CDA->getElementAsConstant(i));
+          }
+        }
+      }
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

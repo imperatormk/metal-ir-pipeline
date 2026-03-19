@@ -97,11 +97,15 @@ public:
   /// Pointee for a specific value (PTM → inference → default).
   llvm::Type *pointeeTypeForValue(const llvm::Value *V) const;
 
+  /// Add a constant to the module constant table (and its sub-constants).
+  /// Public so that FunctionWriter can ensure aggregate sub-constants exist
+  /// in the module constant table before ConstantsWriter references them.
+  void addModuleConstant(const llvm::Constant *C);
+
 private:
   unsigned addType(llvm::Type *T);
   unsigned addFunctionType(llvm::FunctionType *FT, const llvm::Function *F);
   unsigned addEntry(TypeEntry E);
-  void addModuleConstant(const llvm::Constant *C);
   void collectMetadataConstants(const llvm::MDNode *N);
 };
 
