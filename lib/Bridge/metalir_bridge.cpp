@@ -14,6 +14,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 
@@ -107,6 +108,7 @@ void *metalir_compile(const char *llText, uint64_t *outLen,
 }
 
 /// Compute total threadgroup memory (addrspace 3) in bytes for a module.
+/// Accounts for inter-global alignment padding to match Metal runtime layout.
 __attribute__((visibility("default")))
 uint64_t metalir_tg_memory_bytes(const char *llText) {
   LLVMContext Ctx;
@@ -117,9 +119,13 @@ uint64_t metalir_tg_memory_bytes(const char *llText) {
 
   auto &DL = M->getDataLayout();
   uint64_t total = 0;
-  for (auto &GV : M->globals())
-    if (GV.getAddressSpace() == 3)  // threadgroup
-      total += DL.getTypeAllocSize(GV.getValueType());
+  for (auto &GV : M->globals()) {
+    if (GV.getAddressSpace() != 3) continue;  // threadgroup only
+    uint64_t size = DL.getTypeAllocSize(GV.getValueType());
+    Align align = GV.getAlign().value_or(Align(1));
+    // Pad current offset to this global's alignment, then add its size
+    total = alignTo(total, align) + size;
+  }
   return total;
 }
 
