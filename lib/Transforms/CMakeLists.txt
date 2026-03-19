@@ -16,6 +16,7 @@ add_library(MetalIRTransforms
   LLVMToAIRIntrinsics.cpp
   LowerIntMinMax.cpp
   LowerAtomicRMW.cpp
+  AsyncEventToAlloca.cpp
   TGGlobalDeadElim.cpp
   TGGlobalCoalesce.cpp
   TGGlobalGEPRewrite.cpp

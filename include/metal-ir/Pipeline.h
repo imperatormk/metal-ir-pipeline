@@ -99,6 +99,12 @@ struct LowerAtomicRMWPass : llvm::PassInfoMixin<LowerAtomicRMWPass> {
   static bool needsRun(llvm::Module &M);
 };
 
+// AsyncEventToAlloca: Convert __tg_async_events TG global to stack alloca.
+struct AsyncEventToAllocaPass : llvm::PassInfoMixin<AsyncEventToAllocaPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);
+  static bool needsRun(llvm::Module &M);
+};
+
 // Pass 12: Remove unreferenced addrspace(3) globals.
 struct TGGlobalDeadElimPass : llvm::PassInfoMixin<TGGlobalDeadElimPass> {
   llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);

@@ -68,6 +68,11 @@ public:
   llvm::DenseMap<llvm::FunctionType *, llvm::SmallVector<unsigned, 8>>
       funcTypeParamIndices;
 
+  /// Per-function-type return type index. When a FunctionType returns a
+  /// pointer with a non-default pointee (e.g., event_t* for async_copy),
+  /// this stores the correct type table index for the return type.
+  llvm::DenseMap<llvm::FunctionType *, unsigned> funcTypeReturnIndex;
+
   ValueEnumerator(llvm::Module &M, const PointeeTypeMap &PTM);
 
   /// Get type index for a non-pointer type.

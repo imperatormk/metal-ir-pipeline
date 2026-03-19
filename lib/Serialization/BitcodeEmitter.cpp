@@ -118,6 +118,76 @@ static void lowerConstantExprs(Module &M) {
   }
 }
 
+// Fix GEP source type / pointer pointee mismatches for Metal typed bitcode.
+//
+// Metal v1 typed-pointer bitcode requires the GEP source element type to match
+// the pointer's pointee type. When a GEP uses a different element type than the
+// pointer (e.g., `gep half, float*3 %ptr`), the GPU JIT rejects it.
+//
+// For TG (AS3) pointers where the buffer is float-typed (from MMA merge) but
+// accessed with half/i8 GEPs (from pipelined loads), we insert identity
+// bitcasts before the GEP. The bitcast creates a new pointer value that the
+// PTM can type as half* instead of float*, making the GEP consistent:
+//   %bc = bitcast float*3 %ptr to float*3  (identity in opaque-ptr IR)
+//   %p = gep half, float*3 %bc, i32 %idx
+// Then PTM sets %bc → half, so typed bitcode sees: gep half, half*3 %bc, idx
+//
+// For device (AS1) pointers with i8 GEPs (from async copy byte offsets),
+// convert to float-stride GEPs since all device pointers are float*.
+static void fixGEPTypeMismatches(Module &M, PointeeTypeMap &PTM) {
+  bool hasMMA = false;
+  for (auto &F : M)
+    if (F.getName().starts_with("air.simdgroup_matrix_8x8_"))
+      hasMMA = true;
+  if (!hasMMA) return;
+
+  auto &Ctx = M.getContext();
+  Type *floatTy = Type::getFloatTy(Ctx);
+
+  for (auto &F : M) {
+    if (F.isDeclaration()) continue;
+    SmallVector<GetElementPtrInst *, 8> toFix;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+          Type *srcTy = GEP->getSourceElementType();
+          if (srcTy == floatTy) continue;
+          if (GEP->getNumIndices() != 1) continue;
+          if (!srcTy->isIntegerTy() && !srcTy->isHalfTy() &&
+              !srcTy->isBFloatTy())
+            continue;
+          unsigned AS = GEP->getPointerAddressSpace();
+          if (AS != metalir::AS::Device && AS != metalir::AS::Threadgroup)
+            continue;
+          toFix.push_back(GEP);
+        }
+
+    for (auto *GEP : toFix) {
+      Type *srcTy = GEP->getSourceElementType();
+      unsigned srcSize = srcTy->getPrimitiveSizeInBits();
+      Value *ptr = GEP->getPointerOperand();
+
+      // Same-size types (e.g., i32 vs float, both 4 bytes):
+      // Just change the GEP source element type to float. The stride is
+      // identical so the pointer arithmetic doesn't change.
+      if (srcSize == 32) {
+        GEP->setSourceElementType(floatTy);
+        GEP->setResultElementType(floatTy);
+        continue;
+      }
+
+      // Different-size types (half=16bit, i8=8bit vs float=32bit):
+      // Insert identity bitcast before GEP to create a new pointer value
+      // with the correct PTM entry. The bitcast is a no-op in opaque-ptr IR
+      // but gives the serializer a different typed pointer for the GEP source.
+      auto *BC = CastInst::Create(Instruction::BitCast, ptr,
+                                   ptr->getType(), "", GEP);
+      GEP->setOperand(0, BC);
+      PTM.set(BC, srcTy);
+    }
+  }
+}
+
 // Fix air.arg_type_name / air.arg_type_size in kernel metadata to match
 // actual parameter pointee types from PTM. The transform pipeline may set
 // all buffer type names to "float" even when the actual type is bfloat/char.
@@ -294,6 +364,12 @@ std::vector<uint8_t> emitMetalBitcode(Module &M, const PointeeTypeMap &PTM) {
   {
     auto &mutablePTM = const_cast<PointeeTypeMap &>(PTM);
     removeRedundantBitcasts(M, mutablePTM);
+  }
+
+  // Convert byte-stride device GEPs to float-stride before lowering.
+  {
+    auto &mutablePTM2 = const_cast<PointeeTypeMap &>(PTM);
+    fixGEPTypeMismatches(M, mutablePTM2);
   }
 
   // Lower ConstantExpr operands to real instructions before enumeration.

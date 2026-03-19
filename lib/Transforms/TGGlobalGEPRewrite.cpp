@@ -379,6 +379,27 @@ static bool retypeByteGlobals(Module &M) {
     Type *elemTy = storeTy;
     if (elemTy->isBFloatTy()) elemTy = Type::getHalfTy(Ctx);
 
+    // When the inferred type is a vector (e.g., <8 x half>) but there are
+    // also scalar GEPs of the element type (e.g., gep half), prefer the
+    // scalar type. This avoids a mismatch where scalar GEPs use `half` but
+    // the buffer is typed as `<8 x half>`, which Metal's typed bitcode rejects.
+    if (auto *VT = dyn_cast<FixedVectorType>(elemTy)) {
+      Type *scalarTy = VT->getElementType();
+      bool hasScalarGEP = false;
+      std::function<void(Value *)> checkGEPs = [&](Value *V) {
+        for (auto *U : V->users()) {
+          if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+            if (GEP->getSourceElementType() == scalarTy)
+              hasScalarGEP = true;
+            checkGEPs(GEP);
+          }
+        }
+      };
+      checkGEPs(GV);
+      if (hasScalarGEP)
+        elemTy = scalarTy;
+    }
+
     unsigned elemSize = DL.getTypeAllocSize(elemTy);
     if (elemSize == 0) continue;
     uint64_t numElems = totalBytes / elemSize;

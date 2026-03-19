@@ -264,7 +264,18 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
           V.push_back(getID(CI->getArgOperand(i)));
         W.EmitRecord(bitc::FUNC_CODE_INST_CALL, V);
       } else if (auto *AI = dyn_cast<AllocaInst>(&I)) {
-        V.push_back(E.typeIdx(AI->getAllocatedType()));
+        // For event storage allocas (alloca ptr addrspace(3)), the
+        // allocated type must be event_t*3, not the default float*3.
+        Type *allocTy = AI->getAllocatedType();
+        if (allocTy->isPointerTy() &&
+            allocTy->getPointerAddressSpace() == 3) {
+          if (auto *evTy = StructType::getTypeByName(AI->getContext(), "event_t"))
+            V.push_back(E.ptrTypeIdx(PointerType::get(AI->getContext(), 3), evTy));
+          else
+            V.push_back(E.typeIdx(allocTy));
+        } else {
+          V.push_back(E.typeIdx(allocTy));
+        }
         V.push_back(E.typeIdx(AI->getArraySize()->getType()));
         V.push_back(getAbsID(AI->getArraySize()));
         V.push_back((1 << 6) | (Log2_32(AI->getAlign().value()) + 1));

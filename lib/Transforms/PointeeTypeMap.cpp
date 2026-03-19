@@ -88,54 +88,231 @@ void PointeeTypeMap::remapI1ToI8(Module &M) {
 }
 
 // ── Initial analysis: scan all pointers and infer types ──────────────────
+//
+// This analysis MUST be self-contained — it may be re-run after pipeline
+// passes invalidate it. All Metal-specific overrides (MMA, async copy)
+// must be here, not only in InferTypedPointersPass.
+
+static constexpr const char *kMMALoad =
+    "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
+static constexpr const char *kMMAStore =
+    "air.simdgroup_matrix_8x8_store.v64f32.p3f32";
 
 PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
                                          ModuleAnalysisManager &AM) {
   PointeeTypeMap ptm;
+  Type *F32 = Type::getFloatTy(M.getContext());
+  Type *I8 = Type::getInt8Ty(M.getContext());
 
-  // Phase 1: Function parameters
+  // Detect MMA and async copy presence
+  bool hasMMA = false;
+  bool hasAsyncCopy = false;
   for (auto &F : M) {
-    for (auto &Arg : F.args()) {
-      if (!Arg.getType()->isPointerTy())
-        continue;
-      if (auto *ty = PointeeTypeMap::inferFromUsage(&Arg))
-        ptm.set(&Arg, ty);
-    }
+    if (F.getName().starts_with("air.simdgroup_matrix_8x8_"))
+      hasMMA = true;
+    if (F.getName().starts_with("air.simdgroup_async_copy_2d."))
+      hasAsyncCopy = true;
   }
 
+  // Phase 1: Function parameters — infer from usage
+  for (auto &F : M)
+    for (auto &Arg : F.args())
+      if (Arg.getType()->isPointerTy())
+        if (auto *ty = PointeeTypeMap::inferFromUsage(&Arg))
+          ptm.set(&Arg, ty);
+
   // Phase 2: Instructions that produce pointers
-  for (auto &F : M) {
-    for (auto &BB : F) {
+  for (auto &F : M)
+    for (auto &BB : F)
       for (auto &I : BB) {
-        if (!I.getType()->isPointerTy())
-          continue;
+        if (!I.getType()->isPointerTy()) continue;
         if (auto *ty = PointeeTypeMap::inferFromUsage(&I))
           ptm.set(&I, ty);
       }
-    }
-  }
 
-  // Phase 2b: Force float* for device pointer phi nodes.
-  // Non-float typed device pointers in phi nodes crash Metal GPU JIT.
-  {
-    Type *F32 = Type::getFloatTy(M.getContext());
+  // Phase 2b: Force float* for device pointer phi nodes
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        auto *PN = dyn_cast<PHINode>(&I);
+        if (!PN || !PN->getType()->isPointerTy()) continue;
+        if (PN->getType()->getPointerAddressSpace() != AS::Device) continue;
+        ptm.set(PN, F32);
+      }
+
+  // Phase 3: Global variables
+  for (auto &GV : M.globals())
+    if (GV.getType()->isPointerTy())
+      ptm.set(&GV, GV.getValueType());
+
+  // Phase 4: Fill gaps — phi incoming, inttoptr, GEP
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        if (!I.getType()->isPointerTy() || ptm.has(&I)) continue;
+        if (auto *PHI = dyn_cast<PHINode>(&I))
+          for (unsigned i = 0; i < PHI->getNumIncomingValues(); ++i)
+            if (auto *ty = ptm.get(PHI->getIncomingValue(i))) {
+              ptm.set(&I, ty);
+              break;
+            }
+        if (isa<IntToPtrInst>(&I))
+          if (auto *ty = PointeeTypeMap::inferFromUsage(&I))
+            ptm.set(&I, ty);
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+          ptm.set(&I, GEP->getResultElementType());
+      }
+
+  // Phase 5: i1* → i8*
+  ptm.remapI1ToI8(M);
+
+  // Phase 6: MMA — collapse device pointers to float*
+  if (hasMMA) {
+    ptm.collapseDevicePointersToFloat(M);
+
+    // Default unresolved device pointers to float*
+    for (auto &F : M)
+      for (auto &Arg : F.args())
+        if (Arg.getType()->isPointerTy() &&
+            Arg.getType()->getPointerAddressSpace() == AS::Device &&
+            !ptm.has(&Arg))
+          ptm.set(&Arg, F32);
+
+    // MMA declaration params → float*
+    for (auto &F : M) {
+      if (!F.isDeclaration()) continue;
+      StringRef name = F.getName();
+      if (name == kMMALoad || name == kMMAStore)
+        for (auto &Arg : F.args())
+          if (Arg.getType()->isPointerTy())
+            ptm.set(&Arg, F32);
+    }
+
+    // Kernel device pointer args → float*
+    for (auto &F : M)
+      if (!F.isDeclaration())
+        for (auto &Arg : F.args())
+          if (Arg.getType()->isPointerTy() &&
+              Arg.getType()->getPointerAddressSpace() == AS::Device)
+            ptm.set(&Arg, F32);
+
+    // MMA call site pointer operands → float*
     for (auto &F : M)
       for (auto &BB : F)
         for (auto &I : BB) {
-          auto *PN = dyn_cast<PHINode>(&I);
-          if (!PN || !PN->getType()->isPointerTy()) continue;
-          if (PN->getType()->getPointerAddressSpace() != AS::Device) continue;
-          ptm.set(PN, F32);
+          auto *CI = dyn_cast<CallInst>(&I);
+          if (!CI || !CI->getCalledFunction()) continue;
+          StringRef name = CI->getCalledFunction()->getName();
+          if (name == kMMALoad || name == kMMAStore)
+            for (unsigned i = 0; i < CI->arg_size(); i++)
+              if (CI->getArgOperand(i)->getType()->isPointerTy())
+                ptm.set(CI->getArgOperand(i), F32);
         }
   }
 
-  // Phase 3: Global variables (TG and device)
-  for (auto &GV : M.globals()) {
-    if (GV.getType()->isPointerTy()) {
-      // For globals, the pointee type is the value type
-      ptm.set(&GV, GV.getValueType());
+  // Phase 7: Async copy overrides (AFTER MMA collapse, re-applies i8*)
+  if (hasAsyncCopy) {
+    StructType *eventTy = StructType::getTypeByName(M.getContext(), "event_t");
+    if (!eventTy)
+      eventTy = StructType::create(M.getContext(), "event_t");
+
+    for (auto &F : M) {
+      if (!F.isDeclaration()) continue;
+      StringRef name = F.getName();
+
+      if (name.starts_with("air.simdgroup_async_copy_2d.")) {
+        // Return type → event_t (set on call results)
+        for (auto &FN : M)
+          for (auto &BB : FN)
+            for (auto &I : BB)
+              if (auto *CI = dyn_cast<CallInst>(&I))
+                if (CI->getCalledFunction() == &F)
+                  ptm.set(CI, eventTy);
+        // Pointer params → i8* (byte copy)
+        for (unsigned i = 0; i < F.arg_size(); i++) {
+          auto &Arg = *F.getArg(i);
+          if (!Arg.getType()->isPointerTy()) continue;
+          ptm.set(&Arg, I8);
+          for (auto *U : F.users())
+            if (auto *CI = dyn_cast<CallInst>(U))
+              if (i < CI->arg_size())
+                ptm.set(CI->getArgOperand(i), I8);
+        }
+      }
+
+      if (name == "air.wait_simdgroup_events") {
+        // Param 1: pointer to event_t pointer storage
+        Type *ptrAs3 = PointerType::get(M.getContext(), 3);
+        if (F.arg_size() >= 2) {
+          auto &Arg = *F.getArg(1);
+          if (Arg.getType()->isPointerTy()) {
+            ptm.set(&Arg, ptrAs3);
+            for (auto *U : F.users())
+              if (auto *CI = dyn_cast<CallInst>(U))
+                if (CI->arg_size() >= 2)
+                  ptm.set(CI->getArgOperand(1), ptrAs3);
+          }
+        }
+      }
     }
+
+    // Event alloca: stores event_t pointers
+    Type *ptrAs3 = PointerType::get(M.getContext(), 3);
+    for (auto &F : M)
+      for (auto &BB : F)
+        for (auto &I : BB)
+          if (auto *AI = dyn_cast<AllocaInst>(&I))
+            if (AI->getAllocatedType()->isPointerTy() &&
+                AI->getAllocatedType()->getPointerAddressSpace() == 3)
+              ptm.set(AI, ptrAs3);
+
+    // Propagate event_t through identity bitcasts
+    for (auto &F : M)
+      for (auto &BB : F)
+        for (auto &I : BB) {
+          auto *BC = dyn_cast<BitCastInst>(&I);
+          if (!BC || BC->getSrcTy() != BC->getDestTy()) continue;
+          if (!BC->getType()->isPointerTy()) continue;
+          if (auto *srcTy = ptm.get(BC->getOperand(0)))
+            if (srcTy == eventTy || isa<PointerType>(srcTy))
+              ptm.set(BC, srcTy);
+        }
   }
+
+  // Phase 8: Fix up ptr-to-ptr bitcasts for typed pointer transitions.
+  // WidenDeviceLoads inserts identity bitcasts (ptr→ptr) before non-float
+  // device loads from phi pointers. MMA collapse clobbers their PTM to float*.
+  // Re-infer from load/store usage.
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        auto *BC = dyn_cast<BitCastInst>(&I);
+        if (!BC || !BC->getType()->isPointerTy()) continue;
+        if (BC->getSrcTy() != BC->getDestTy()) continue;
+        if (BC->getType()->getPointerAddressSpace() != AS::Device) continue;
+        for (auto *U : BC->users()) {
+          if (auto *LI = dyn_cast<LoadInst>(U)) {
+            if (!LI->getType()->isFloatTy()) {
+              ptm.set(BC, LI->getType());
+              break;
+            }
+          }
+          if (auto *SI = dyn_cast<StoreInst>(U)) {
+            if (SI->getPointerOperand() == BC &&
+                !SI->getValueOperand()->getType()->isFloatTy()) {
+              ptm.set(BC, SI->getValueOperand()->getType());
+              break;
+            }
+          }
+        }
+      }
+
+  // Phase 9: Function pointer
+  for (auto &F : M)
+    if (!F.isDeclaration()) {
+      ptm.set(&F, F.getFunctionType());
+      break;
+    }
 
   return ptm;
 }

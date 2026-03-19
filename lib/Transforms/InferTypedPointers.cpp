@@ -199,6 +199,164 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
     }
   }
 
+  // Phase 6: Async copy intrinsic pointer types.
+  //
+  // MUST run AFTER Phase 3 (MMA collapse) and Phase 5 (MMA overrides)
+  // because those phases clobber all device pointer PTM entries to float*.
+  // Async copy intrinsics require i8* for both TG and device pointer params,
+  // and event_t* for return types and event storage.
+  //
+  // air.simdgroup_async_copy_2d returns %event_t addrspace(3)* — an opaque
+  // event handle stored in threadgroup memory. The __tg_async_events global
+  // stores these event pointers. We must:
+  //   1. Create the %event_t opaque struct type if not present
+  //   2. Set return type of async_copy intrinsics to event_t
+  //   3. Set TG pointer params to i8* (raw byte copies)
+  //   4. Set device pointer params to i8* (raw byte copies)
+  //   5. Set __tg_async_events GEP/bitcast types to event_t
+  //   6. Set wait_simdgroup_events pointer param to event_t
+  {
+    bool hasAsyncCopy = false;
+    for (auto &F : M)
+      if (F.getName().starts_with("air.simdgroup_async_copy_2d."))
+        hasAsyncCopy = true;
+
+    if (hasAsyncCopy) {
+      Type *I8 = Type::getInt8Ty(M.getContext());
+
+      // Get or create %event_t = type opaque
+      StructType *eventTy = StructType::getTypeByName(M.getContext(), "event_t");
+      if (!eventTy)
+        eventTy = StructType::create(M.getContext(), "event_t");
+
+      for (auto &F : M) {
+        if (!F.isDeclaration()) continue;
+        StringRef name = F.getName();
+
+        if (name.starts_with("air.simdgroup_async_copy_2d.")) {
+          // Return type: %event_t* (pointer to opaque event in TG)
+          for (auto &FN : M)
+            for (auto &BB : FN)
+              for (auto &I : BB)
+                if (auto *CI = dyn_cast<CallInst>(&I))
+                  if (CI->getCalledFunction() == &F)
+                    PTM.set(CI, eventTy);
+
+          // Pointer params: TG ptr (param 2) = i8*, device ptr (param 6) = i8*
+          // (they copy raw bytes — sizeof/alignof are explicit params 0,1)
+          for (unsigned i = 0; i < F.arg_size(); i++) {
+            auto &Arg = *F.getArg(i);
+            if (!Arg.getType()->isPointerTy()) continue;
+            PTM.set(&Arg, I8);
+            // Also set call site arg values — overrides MMA's float*
+            for (auto *U : F.users())
+              if (auto *CI = dyn_cast<CallInst>(U))
+                if (i < CI->arg_size())
+                  PTM.set(CI->getArgOperand(i), I8);
+          }
+        }
+
+        if (name == "air.wait_simdgroup_events") {
+          // Param 1: pointer to event_t pointer storage.
+          // The data at the pointed-to location is event_t addrspace(3)*
+          // (an event pointer), so the pointee type is ptr addrspace(3).
+          // The inner ptr resolves to event_t via inferredPointee in the
+          // ValueEnumerator, giving: POINTER(POINTER(event_t, 3), 3).
+          Type *ptrAs3 = PointerType::get(M.getContext(), 3);
+          if (F.arg_size() >= 2) {
+            auto &Arg = *F.getArg(1);
+            if (Arg.getType()->isPointerTy()) {
+              PTM.set(&Arg, ptrAs3);
+              for (auto *U : F.users())
+                if (auto *CI = dyn_cast<CallInst>(U))
+                  if (CI->arg_size() >= 2)
+                    PTM.set(CI->getArgOperand(1), ptrAs3);
+            }
+          }
+        }
+      }
+
+      // Event storage: either __tg_async_events TG global (before
+      // AsyncEventToAlloca) or ev_alloca stack alloca (after).
+      Type *ptrAs3_ev = PointerType::get(M.getContext(), 3);
+      if (auto *GV = M.getNamedGlobal("__tg_async_events")) {
+        PTM.set(GV, GV->getValueType());
+        for (auto *U : GV->users()) {
+          if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+            PTM.set(GEP, ptrAs3_ev);
+            for (auto *GU : GEP->users())
+              if (auto *BC = dyn_cast<BitCastInst>(GU))
+                if (BC->getSrcTy() == BC->getDestTy())
+                  PTM.set(BC, ptrAs3_ev);
+          }
+        }
+      }
+      // Event alloca: any alloca of ptr addrspace(3) stores event pointers.
+      // Handles both named (ev_alloca from AsyncEventToAlloca) and unnamed
+      // (from MLIR lowering) allocas.
+      for (auto &FN : M) {
+        for (auto &BB : FN) {
+          for (auto &I : BB) {
+            auto *AI = dyn_cast<AllocaInst>(&I);
+            if (!AI) continue;
+            // Check allocated type: ptr addrspace(3) or [N x ptr addrspace(3)]
+            Type *allocTy = AI->getAllocatedType();
+            bool isEventStorage = false;
+            if (allocTy->isPointerTy() &&
+                allocTy->getPointerAddressSpace() == 3)
+              isEventStorage = true;
+            if (auto *AT = dyn_cast<ArrayType>(allocTy))
+              if (AT->getElementType()->isPointerTy() &&
+                  AT->getElementType()->getPointerAddressSpace() == 3)
+                isEventStorage = true;
+            if (isEventStorage)
+              PTM.set(AI, ptrAs3_ev);
+          }
+        }
+      }
+    }
+  }
+
+  // Phase 7: Fix up ptr-to-ptr bitcasts that serve as typed pointer transitions.
+  //
+  // WidenDeviceLoads Phase B inserts identity bitcasts (ptr→ptr in opaque IR)
+  // before non-float device loads from phi pointers. These bitcasts exist so
+  // the serializer can assign a different typed pointer (e.g., half*) to the
+  // bitcast result vs. the phi source (float*).
+  //
+  // The MMA collapse (Phase 3) and MMA overrides (Phase 5) may have clobbered
+  // the PTM entries for these bitcasts to float*. Re-infer from usage: if a
+  // ptr-to-ptr bitcast feeds a non-float load or store, set its PTM to the
+  // load/store element type.
+  for (auto &F : M) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *BC = dyn_cast<BitCastInst>(&I);
+        if (!BC || !BC->getType()->isPointerTy()) continue;
+        if (BC->getSrcTy() != BC->getDestTy()) continue;
+        unsigned addrSpace = BC->getType()->getPointerAddressSpace();
+        if (addrSpace != AS::Device) continue;
+
+        // Check what this bitcast feeds — look for loads/stores
+        for (auto *U : BC->users()) {
+          if (auto *LI = dyn_cast<LoadInst>(U)) {
+            if (!LI->getType()->isFloatTy()) {
+              PTM.set(BC, LI->getType());
+              break;
+            }
+          }
+          if (auto *SI = dyn_cast<StoreInst>(U)) {
+            if (SI->getPointerOperand() == BC &&
+                !SI->getValueOperand()->getType()->isFloatTy()) {
+              PTM.set(BC, SI->getValueOperand()->getType());
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
   return PreservedAnalyses::all();
 }
 

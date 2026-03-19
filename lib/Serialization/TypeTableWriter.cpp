@@ -50,7 +50,12 @@ void emitTypeBlock(BitstreamWriter &W, ValueEnumerator &E) {
       W.EmitRecord(bitc::TYPE_CODE_ARRAY, V);
     } else if (auto *FT = dyn_cast<FunctionType>(T)) {
       V.push_back(FT->isVarArg() ? 1 : 0);
-      V.push_back(E.typeIdx(FT->getReturnType()));
+      // Use stored return type index for pointer returns with custom pointee
+      auto rit = E.funcTypeReturnIndex.find(FT);
+      if (rit != E.funcTypeReturnIndex.end())
+        V.push_back(rit->second);
+      else
+        V.push_back(E.typeIdx(FT->getReturnType()));
       // Use stored per-param indices for correct multi-pointee support
       auto pit = E.funcTypeParamIndices.find(FT);
       if (pit != E.funcTypeParamIndices.end()) {
@@ -60,7 +65,17 @@ void emitTypeBlock(BitstreamWriter &W, ValueEnumerator &E) {
       }
       W.EmitRecord(bitc::TYPE_CODE_FUNCTION, V);
     } else if (auto *ST = dyn_cast<StructType>(T)) {
-      if (ST->hasName()) {
+      if (ST->isOpaque()) {
+        // Opaque struct (e.g., %event_t = type opaque).
+        // Metal/LLVM v1 bitcode: STRUCT_NAME + TYPE_CODE_OPAQUE [isPacked=0]
+        if (ST->hasName()) {
+          SmallVector<uint64_t, 32> NV;
+          for (char C : ST->getName()) NV.push_back((uint64_t)(unsigned char)C);
+          W.EmitRecord(bitc::TYPE_CODE_STRUCT_NAME, NV);
+        }
+        V.push_back(0); // isPacked
+        W.EmitRecord(bitc::TYPE_CODE_OPAQUE, V);
+      } else if (ST->hasName()) {
         SmallVector<uint64_t, 32> NV;
         for (char C : ST->getName()) NV.push_back((uint64_t)(unsigned char)C);
         W.EmitRecord(bitc::TYPE_CODE_STRUCT_NAME, NV);

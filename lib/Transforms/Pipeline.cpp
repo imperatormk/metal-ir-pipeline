@@ -104,6 +104,9 @@ void buildMetalIRPipeline(ModulePassManager &MPM) {
   maybeAdd(SplitI64ShufflePass(), "SplitI64Shuffle");
   maybeAdd(LowerAtomicRMWPass(), "LowerAtomicRMW");
 
+  // Phase 3b: Convert async event TG global to stack alloca
+  maybeAdd(AsyncEventToAllocaPass(), "AsyncEventToAlloca");
+
   // Phase 4: TG memory management (strict order)
   maybeAdd(TGGlobalDeadElimPass(), "TGGlobalDeadElim");
   maybeAdd(TGGlobalCoalescePass(), "TGGlobalCoalesce");

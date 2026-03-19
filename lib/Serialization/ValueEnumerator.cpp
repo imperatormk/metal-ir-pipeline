@@ -28,16 +28,53 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
           inferredPointee[Arg.getType()] = ty;
 
   // PTM overrides — but skip global variables (they get separate TypeEntry
-  // via globalPtrTypeIdx, not the shared inferredPointee)
+  // via globalPtrTypeIdx, not the shared inferredPointee).
+  // Skip event_t-typed entries for AS3 — these should NOT set the AS3
+  // default because MMA TG pointers need float*3 as default. Event pointers
+  // use per-value PTM entries via ptrTypeIdxForValue/funcTypeParamIndices.
   for (auto &[V, T] : PTM)
     if (V->getType()->isPointerTy() && !isa<GlobalVariable>(V) &&
-        !inferredPointee.count(V->getType()))
+        !inferredPointee.count(V->getType())) {
+      // Skip opaque struct types (event_t) from setting TYPE-level defaults
+      if (auto *ST = dyn_cast<StructType>(T))
+        if (ST->isOpaque())
+          continue;
+      // Skip ptr-typed pointees (ptr addrspace(3) used for event storage)
+      // — these would make AS0 default to ptr*0, which is wrong.
+      if (T->isPointerTy())
+        continue;
       inferredPointee[V->getType()] = T;
+    }
 
   // ── Phase 2: Enumerate types ───────────────────────────────────────
 
   addType(Type::getVoidTy(Ctx));
   addType(Type::getFloatTy(Ctx));
+
+  // Pre-create event_t type BEFORE function type processing.
+  // Async copy intrinsics return event_t addrspace(3)* and wait_simdgroup_events
+  // takes a pointer-to-event-pointer. The event_t type must exist before
+  // function types reference it, to avoid forward references in the type table
+  // (which crash Metal's LLVM 14-based reader).
+  //
+  // CRITICAL: Set inferredPointee[ptrAs3] = eventTy so that any bare
+  // typeIdx(ptrAs3) call during emission resolves to event_t*3 (not i8*3
+  // or float*3). This is needed for wait_simdgroup_events param 1, whose
+  // pointee is ptrAs3 — the emission calls typeIdx(ptrAs3) which uses
+  // inferredPointee to determine the inner pointer's pointee type.
+  // The i8*3 entries for async copy buffer params are handled separately
+  // through per-param funcTypeParamIndices, not this TYPE-LEVEL default.
+  {
+    StructType *eventTy = StructType::getTypeByName(Ctx, "event_t");
+    if (eventTy) {
+      addType(eventTy);
+      auto *ptrAs3 = PointerType::get(Ctx, 3);
+      inferredPointee[ptrAs3] = eventTy;
+      // Also pre-create the event_t*3 pointer entry so it exists before
+      // function type processing (avoids forward references).
+      ptrTypeIdx(ptrAs3, eventTy);
+    }
+  }
 
   // Enumerate function types — definitions first, then declarations.
   // Must process definitions first so their per-param pointee inference
@@ -75,6 +112,15 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
         for (auto &Op : I.operands())
           if (!isa<BasicBlock>(Op))
             addType(Op->getType());
+        // Alloca: enumerate the allocated type AND the result's typed-pointer.
+        // The alloca result is pointer_to(allocatedType, addrspace=0).
+        // Both the allocated type and the result pointer type must exist
+        // in the type table for the bitcode reader to materialize correctly.
+        if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+          addType(AI->getAllocatedType());
+          // Create result type entry: ptr(allocatedType, 0)
+          ptrTypeIdx(PointerType::get(M.getContext(), 0), AI->getAllocatedType());
+        }
         // GEP result: create ptr(elementType, addrspace) entry
         // Use PTM override for device (AS 1) pointers (e.g., store float
         // through i8* GEP should produce float*, not i8*).
@@ -260,8 +306,36 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
   // Build per-param type indices with correct pointee types
   SmallVector<unsigned, 8> paramIndices;
 
-  // Add return type first
-  addType(FT->getReturnType());
+  // Add return type — for pointer returns, infer pointee from call results
+  if (FT->getReturnType()->isPointerTy()) {
+    Type *retPointee = nullptr;
+    // Async copy intrinsics return event_t addrspace(3)*.
+    // Must check function name because async_copy may be declared but never
+    // called (no users to infer from via PTM).
+    if (F && F->isDeclaration() &&
+        F->getName().starts_with("air.simdgroup_async_copy")) {
+      auto &Ctx = F->getContext();
+      if (auto *eventTy = StructType::getTypeByName(Ctx, "event_t"))
+        retPointee = eventTy;
+    }
+    // For declarations, infer from how call results are typed in PTM
+    if (!retPointee && F && F->isDeclaration()) {
+      for (auto *U : F->users()) {
+        if (auto *CI = dyn_cast<CallInst>(U)) {
+          if (auto *ty = PTM.get(const_cast<CallInst *>(CI))) {
+            retPointee = ty;
+            break;
+          }
+        }
+      }
+    }
+    if (!retPointee)
+      retPointee = pointeeType(FT->getReturnType());
+    unsigned retIdx = ptrTypeIdx(FT->getReturnType(), retPointee);
+    funcTypeReturnIndex[FT] = retIdx;
+  } else {
+    addType(FT->getReturnType());
+  }
 
   // Add each param type — for pointers, use per-param pointee inference
   for (unsigned i = 0; i < FT->getNumParams(); i++) {
@@ -287,6 +361,24 @@ unsigned ValueEnumerator::addFunctionType(FunctionType *FT, const Function *F) {
           else if (name.ends_with(".f32"))
             pointee = Type::getFloatTy(F->getContext());
         }
+      }
+      // Async copy intrinsics use i8* for buffer pointer params.
+      // The intrinsic name suffix (e.g., .p3i8.p1i8) indicates byte pointers.
+      // Use i8* for both AS3 (destination) and AS1 (source) pointer params.
+      if (name.starts_with("air.simdgroup_async_copy")) {
+        unsigned addrSpace = cast<PointerType>(PT)->getAddressSpace();
+        if (addrSpace == 1 || addrSpace == 3)
+          pointee = Type::getInt8Ty(F->getContext());
+      }
+      // wait_simdgroup_events param 1: pointer to event_t*3 storage.
+      // inferredPointee[ptrAs3] = event_t is set permanently in the
+      // constructor when event_t exists, so typeIdx(ptrAs3) at emission
+      // time resolves to event_t*3. Just set pointee = ptrAs3.
+      if (name == "air.wait_simdgroup_events" && i == 1) {
+        auto *ptrAs3 = PointerType::get(F->getContext(), 3);
+        pointee = ptrAs3;
+        paramIndices.push_back(ptrTypeIdx(PT, pointee));
+        continue; // Skip the normal param processing below
       }
     }
 
