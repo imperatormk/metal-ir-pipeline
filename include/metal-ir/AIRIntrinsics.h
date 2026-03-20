@@ -115,13 +115,24 @@ inline std::string atomicName(AtomicLocality loc, AtomicOp op, AtomicType ty) {
 
 // ── MMA intrinsic names ──────────────────────────────────────────────
 
-// Threadgroup memory MMA (addrspace 3)
+// f32 MMA — threadgroup memory (addrspace 3)
 constexpr const char *kMMALoadTG = "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
 constexpr const char *kMMAStoreTG = "air.simdgroup_matrix_8x8_store.v64f32.p3f32";
 
-// Device memory MMA (addrspace 1) — direct loads/stores, no TG roundtrip
+// f32 MMA — device memory (addrspace 1)
 constexpr const char *kMMALoadDevice = "air.simdgroup_matrix_8x8_load.v64f32.p1f32";
 constexpr const char *kMMAStoreDevice = "air.simdgroup_matrix_8x8_store.v64f32.p1f32";
+
+// f16 MMA — device memory (addrspace 1)
+constexpr const char *kMMALoadDeviceF16 = "air.simdgroup_matrix_8x8_load.v64f16.p1f16";
+constexpr const char *kMMADeviceF16 = "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f16.v64f16.v64f32";
+
+// bf16 MMA — threadgroup memory (addrspace 3)
+constexpr const char *kMMALoadTGBF16 = "air.simdgroup_matrix_8x8_load.v64bf16.p3bf16";
+
+// bf16 MMA — device memory (addrspace 1)
+constexpr const char *kMMALoadDeviceBF16 = "air.simdgroup_matrix_8x8_load.v64bf16.p1bf16";
+constexpr const char *kMMADeviceBF16 = "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64bf16.v64bf16.v64f32";
 
 // ── Metadata string constants ────────────────────────────────────────
 

@@ -196,9 +196,12 @@ PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
         else if (name.contains("p1f16") &&
                  name.starts_with("air.simdgroup_matrix_8x8_"))
           ptrPointee = F16;
-        else if (name.contains("p1bf16") &&
+        else if ((name.contains("p1bf16") || name.contains("p3bf16")) &&
                  name.starts_with("air.simdgroup_matrix_8x8_"))
           ptrPointee = BF16;
+        else if ((name.contains("p1f16") || name.contains("p3f16")) &&
+                 name.starts_with("air.simdgroup_matrix_8x8_"))
+          ptrPointee = F16;
         if (ptrPointee)
           for (auto &Arg : F.args())
             if (Arg.getType()->isPointerTy())
@@ -226,9 +229,9 @@ PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
           if (name == kMMALoad || name == kMMAStore ||
               name == kMMALoadDev || name == kMMAStoreDev)
             ptrPointee = F32;
-          else if (name.contains("p1f16"))
+          else if (name.contains("p1f16") || name.contains("p3f16"))
             ptrPointee = Type::getHalfTy(M.getContext());
-          else if (name.contains("p1bf16"))
+          else if (name.contains("p1bf16") || name.contains("p3bf16"))
             ptrPointee = Type::getBFloatTy(M.getContext());
           else if (name.contains("p3f32"))
             ptrPointee = F32;
