@@ -665,6 +665,101 @@ static bool fixResidualI8GEPs(Module &M) {
   return changed;
 }
 
+// ── 14f: Fix mismatched-type GEPs on TG pointers ────────────────────────
+// After scalarization + merge, we can have:
+//   %p = gep float, @tg_global, i64 N     ; float* TG pointer
+//   %q = gep i32,   %p,         i32 2     ; i32*  -- TYPE MISMATCH
+//   store i32 %v, %q
+// Metal GPU JIT crashes on non-float typed TG pointers (i32*, i8*, etc.)
+// when float-typed MMA globals are present. Fix by rewriting GEPs to use
+// the parent's element type (float) and inserting bitcasts for stores/loads.
+static bool fixMismatchedTGGEPs(Module &M) {
+  bool changed = false;
+  auto &DL = M.getDataLayout();
+  auto &Ctx = M.getContext();
+
+  for (auto &F : M) {
+    if (F.isDeclaration()) continue;
+
+    SmallVector<GetElementPtrInst *, 16> mismatchGeps;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+          if (GEP->getPointerAddressSpace() == AS::Threadgroup) {
+            Type *gepSrcTy = GEP->getSourceElementType();
+            // Skip array-typed GEPs (these are preamble GEPs like gep [N x float], @g, 0, 0)
+            if (isa<ArrayType>(gepSrcTy)) continue;
+            // Skip float-typed GEPs (already correct)
+            if (gepSrcTy->isFloatTy()) continue;
+            // Check if the parent pointer was typed as float
+            auto *srcGEP = dyn_cast<GetElementPtrInst>(GEP->getPointerOperand());
+            if (!srcGEP) continue;
+            Type *parentTy = srcGEP->getSourceElementType();
+            if (auto *AT = dyn_cast<ArrayType>(parentTy))
+              parentTy = AT->getElementType();
+            if (!parentTy->isFloatTy()) continue;
+            // This GEP's source type doesn't match parent's float type
+            unsigned gepElemSize = DL.getTypeAllocSize(gepSrcTy);
+            unsigned floatSize = DL.getTypeAllocSize(parentTy);
+            // Only fix same-size types (i32 = float = 4 bytes)
+            if (gepElemSize == floatSize)
+              mismatchGeps.push_back(GEP);
+          }
+
+    for (auto *GEP : mismatchGeps) {
+      IRBuilder<> B(GEP);
+      Type *floatTy = Type::getFloatTy(Ctx);
+      // Rewrite: gep i32, %p, idx → gep float, %p, idx
+      // (same byte offset since sizeof(i32) == sizeof(float))
+      Value *idx = GEP->getOperand(1);
+      auto *newGEP = B.CreateInBoundsGEP(floatTy, GEP->getPointerOperand(),
+                                           idx, GEP->getName());
+
+      // Fix users: insert bitcasts for stores and loads
+      SmallVector<Instruction *, 8> users;
+      for (auto *U : GEP->users())
+        if (auto *I = dyn_cast<Instruction>(U))
+          users.push_back(I);
+
+      for (auto *U : users) {
+        if (auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand() == GEP) {
+            // store i32 %v, ptr %gep → store float (bitcast i32 %v to float), ptr %newGEP
+            IRBuilder<> SB(SI);
+            Value *val = SI->getValueOperand();
+            if (!val->getType()->isFloatTy())
+              val = SB.CreateBitCast(val, floatTy);
+            SB.CreateAlignedStore(val, newGEP, SI->getAlign(), SI->isVolatile());
+            SI->eraseFromParent();
+          }
+        } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+          if (!LI->getType()->isFloatTy()) {
+            // load i32, ptr %gep → bitcast (load float, ptr %newGEP) to i32
+            IRBuilder<> LB(LI);
+            auto *newLoad = LB.CreateAlignedLoad(floatTy, newGEP,
+                                                   LI->getAlign(), LI->isVolatile());
+            Value *casted = LB.CreateBitCast(newLoad, LI->getType());
+            LI->replaceAllUsesWith(casted);
+            LI->eraseFromParent();
+          } else {
+            LI->setOperand(0, newGEP);
+          }
+        } else {
+          // Other users: just swap the operand
+          for (unsigned i = 0; i < U->getNumOperands(); i++)
+            if (U->getOperand(i) == GEP)
+              U->setOperand(i, newGEP);
+        }
+      }
+
+      if (GEP->use_empty())
+        GEP->eraseFromParent();
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 // ── Main pass: orchestrate sub-passes ──────────────────────────────────
 PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
                                                ModuleAnalysisManager &AM) {
@@ -679,6 +774,19 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
   // 14a: Split mixed-type byte globals
   changed |= splitMixedByteGlobals(M, byteGlobals);
 
+  // Pre-14b: Scalarize wide vector stores in byte globals so merge can proceed.
+  // The pipeliner (num_stages>1) stores <2 x float> vectors to global_smem;
+  // mergeByteMMA bails on wide vectors. Scalarize them first.
+  // IMPORTANT: Only do this when there are MMA globals to merge with.
+  // Non-dot kernels (cat, reduce, etc.) have no MMA globals, and scalarizing
+  // their vector stores creates element-typed GEPs that conflict with
+  // downstream retypeByteGlobals/mergeByteMMA which expect i8-typed GEPs.
+  if (mmaGlobals.size() == 1) {
+    Type *I32 = Type::getInt32Ty(M.getContext());
+    for (auto *GV : byteGlobals)
+      changed |= scalarizeWideVecStores(GV, I32);
+  }
+
   // 14b: Merge byte globals into MMA globals
   changed |= mergeByteMMA(M, byteGlobals, mmaGlobals);
 
@@ -689,7 +797,15 @@ PreservedAnalyses TGGlobalGEPRewritePass::run(Module &M,
   changed |= insertPreambleGEPs(M);
 
   // 14e: Fix residual i8 GEPs on typed TG pointers
-  changed |= fixResidualI8GEPs(M);
+  // Run iteratively: scalarized i8 GEPs form chains (gep i8 → gep i8 → ...),
+  // and each iteration peels one level. Converges in 2-3 iterations.
+  for (int iter = 0; iter < 8; iter++) {
+    if (!fixResidualI8GEPs(M)) break;
+    changed = true;
+  }
+
+  // 14f: Fix mismatched-type GEPs (e.g., gep i32 on float* TG pointer)
+  changed |= fixMismatchedTGGEPs(M);
 
   return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

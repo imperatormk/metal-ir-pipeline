@@ -237,6 +237,58 @@ inline bool scalarizeVec1Users(llvm::Value *V, llvm::Type *I32Ty) {
   return changed;
 }
 
+// ── Scalarize wide vector stores to TG byte globals ───────────────────────
+// Decomposes `store <N x T> %v, ptr addrspace(3) %p` into N scalar stores:
+//   extractelement + gep + store for each element.
+// This enables the TGGlobalGEPRewrite merge path which bails on wide vectors.
+
+inline bool scalarizeWideVecStores(llvm::Value *V, llvm::Type *I32Ty) {
+  bool changed = false;
+  auto &DL = llvm::cast<llvm::GlobalVariable>(V)->getParent()->getDataLayout();
+  llvm::SmallVector<llvm::StoreInst *, 8> wideStores;
+  std::function<void(llvm::Value *)> findWide = [&](llvm::Value *V) {
+    for (auto *U : V->users()) {
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(U)) {
+        if (SI->getPointerOperand() == V) {
+          auto *VT = llvm::dyn_cast<llvm::FixedVectorType>(
+              SI->getValueOperand()->getType());
+          if (VT && VT->getNumElements() > 1) wideStores.push_back(SI);
+        }
+      } else if (llvm::isa<llvm::GetElementPtrInst>(U) ||
+                 llvm::isa<llvm::BitCastInst>(U)) {
+        findWide(U);
+      }
+    }
+  };
+  findWide(V);
+  for (auto *SI : wideStores) {
+    auto *VT = llvm::cast<llvm::FixedVectorType>(
+        SI->getValueOperand()->getType());
+    llvm::Type *elemTy = VT->getElementType();
+    unsigned elemSize = DL.getTypeAllocSize(elemTy);
+    unsigned N = VT->getNumElements();
+    llvm::IRBuilder<> B(SI);
+    llvm::Value *basePtr = SI->getPointerOperand();
+    for (unsigned i = 0; i < N; i++) {
+      llvm::Value *scalar = B.CreateExtractElement(
+          SI->getValueOperand(), llvm::ConstantInt::get(I32Ty, i));
+      // Use element-type GEP for ALL elements (including i=0) so that
+      // downstream rewriteByteGEPs/fixResidualI8GEPs don't incorrectly
+      // divide the offset by a larger type's size (e.g., half offset /
+      // float size = 0). The i=0 GEP is also needed as a typed-pointer
+      // transition point when the base pointer is later retyped (e.g.,
+      // byte global merged into float MMA global — the half GEP creates
+      // a half*3 pointer for the store, avoiding float*3 type mismatch).
+      llvm::Value *ptr = B.CreateInBoundsGEP(elemTy, basePtr,
+          llvm::ConstantInt::get(I32Ty, i));
+      B.CreateStore(scalar, ptr);
+    }
+    SI->eraseFromParent();
+    changed = true;
+  }
+  return changed;
+}
+
 // ── Fold extract(insert(undef, x, 0), 0) → x ─────────────────────────────
 // Cleans up after vec1 scalarization. Returns true if any changes were made.
 

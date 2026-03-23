@@ -173,8 +173,22 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
       }
 
       if (succHasTGStore) {
-        IRBuilder<> B(term);
-        createBarrier(B, M);
+        // IMPORTANT: barrier immediately before a conditional branch in
+        // the same block crashes the Metal GPU JIT ("Failed to
+        // materializeAll"). Split the block so the barrier and branch
+        // are in separate blocks.
+        if (auto *BI = dyn_cast<BranchInst>(term); BI && BI->isConditional()) {
+          // Split: create a new block for the barrier, insert it
+          // between BB and the branch.
+          BasicBlock *splitBB = BB.splitBasicBlock(term, BB.getName() + ".war");
+          // splitBasicBlock inserts an unconditional br at the end of BB.
+          // Insert barrier before that unconditional br.
+          IRBuilder<> B(BB.getTerminator());
+          createBarrier(B, M);
+        } else {
+          IRBuilder<> B(term);
+          createBarrier(B, M);
+        }
         changed = true;
       }
     }
