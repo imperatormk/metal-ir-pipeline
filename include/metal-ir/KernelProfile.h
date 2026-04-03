@@ -41,6 +41,7 @@ struct KernelFacts {
   bool hasNonFloatDeviceLoad = false;  // device load of half/i32/etc
   bool hasNonFloatDeviceStore = false; // device store of half/i32/etc
   bool hasStructPhi = false;           // struct-typed PHI nodes
+  bool hasMMA = false;                 // calls simdgroup MMA intrinsics
 
   // ── Derived properties ──────────────────────────────────────────────
 
@@ -57,7 +58,7 @@ struct KernelFacts {
 
   /// Needs device load widening: has non-float device loads (MMA context).
   bool needsDeviceLoadWidening() const {
-    return hasNonFloatDeviceLoad;
+    return hasMMA && (hasNonFloatDeviceLoad || hasNonFloatDeviceStore);
   }
 
   /// Needs volatile device loads: has device stores in loops.

@@ -102,6 +102,16 @@ static constexpr const char *kMMALoadDev =
 static constexpr const char *kMMAStoreDev =
     "air.simdgroup_matrix_8x8_store.v64f32.p1f32";
 
+static bool functionUsesMMA(const Function &F) {
+  for (const auto &BB : F)
+    for (const auto &I : BB)
+      if (const auto *CI = dyn_cast<CallInst>(&I))
+        if (const auto *Callee = CI->getCalledFunction())
+          if (Callee->getName().starts_with("air.simdgroup_matrix_8x8_"))
+            return true;
+  return false;
+}
+
 PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
                                          ModuleAnalysisManager &AM) {
   PointeeTypeMap ptm;
@@ -111,11 +121,14 @@ PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
   // Detect MMA and async copy presence
   bool hasMMA = false;
   bool hasAsyncCopy = false;
+  DenseMap<const Function *, bool> functionHasMMA;
   for (auto &F : M) {
     if (F.getName().starts_with("air.simdgroup_matrix_8x8_"))
       hasMMA = true;
     if (F.getName().starts_with("air.simdgroup_async_copy_2d."))
       hasAsyncCopy = true;
+    if (!F.isDeclaration())
+      functionHasMMA[&F] = functionUsesMMA(F);
   }
 
   // Phase 1: Function parameters — infer from usage
@@ -170,17 +183,30 @@ PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
   // Phase 5: i1* → i8*
   ptm.remapI1ToI8(M);
 
-  // Phase 6: MMA — collapse device pointers to float*
+  // Phase 6: MMA — collapse device pointers to float* only in functions that
+  // actually use MMA intrinsics.
   if (hasMMA) {
-    ptm.collapseDevicePointersToFloat(M);
+    for (auto &F : M) {
+      if (F.isDeclaration() || !functionHasMMA.lookup(&F))
+        continue;
 
-    // Default unresolved device pointers to float*
-    for (auto &F : M)
+      for (auto &Arg : F.args())
+        if (Arg.getType()->isPointerTy() &&
+            Arg.getType()->getPointerAddressSpace() == AS::Device)
+          ptm.set(&Arg, F32);
+
+      for (auto &BB : F)
+        for (auto &I : BB)
+          if (I.getType()->isPointerTy() &&
+              I.getType()->getPointerAddressSpace() == AS::Device)
+            ptm.set(&I, F32);
+
       for (auto &Arg : F.args())
         if (Arg.getType()->isPointerTy() &&
             Arg.getType()->getPointerAddressSpace() == AS::Device &&
             !ptm.has(&Arg))
           ptm.set(&Arg, F32);
+    }
 
     // MMA declaration params → typed pointer (float*/half*/bfloat*)
     {
@@ -209,9 +235,9 @@ PointeeTypeMap PointeeTypeAnalysis::run(Module &M,
       }
     }
 
-    // Kernel device pointer args → float*
+    // MMA kernel device pointer args → float*
     for (auto &F : M)
-      if (!F.isDeclaration())
+      if (!F.isDeclaration() && functionHasMMA.lookup(&F))
         for (auto &Arg : F.args())
           if (Arg.getType()->isPointerTy() &&
               Arg.getType()->getPointerAddressSpace() == AS::Device)

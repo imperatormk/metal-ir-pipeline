@@ -11,6 +11,7 @@
 // ═══════════════════════════════════════════════════════════════════════
 
 #include "metal-ir/Pipeline.h"
+#include "metal-ir/KernelProfile.h"
 #include "metal-ir/MetalConstraints.h"
 #include "metal-ir/PointeeTypeMap.h"
 
@@ -38,6 +39,7 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
   // PointeeTypeAnalysis does the initial inference pass.
   // We refine it here with Metal-specific rules.
   auto &PTM = AM.getResult<PointeeTypeAnalysis>(M);
+  auto &profiles = AM.getResult<KernelProfileAnalysis>(M);
 
   MetalConstraints constraints;
   constraints.hasMMA = AM.getResult<MMAPresenceAnalysis>(M).hasMMA;
@@ -147,12 +149,33 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
   // Phase 2: Apply Metal constraints — i1* → i8*
   PTM.remapI1ToI8(M);
 
-  // Phase 3: If MMA present, all device pointers → float*
-  if (constraints.hasMMA)
-    PTM.collapseDevicePointersToFloat(M);
+  // Phase 3: If MMA is used in a function, collapse only that function's
+  // device pointers to float*. Non-MMA functions can keep narrower pointee
+  // types and avoid the widening path.
+  if (constraints.hasMMA) {
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      auto it = profiles.find(&F);
+      if (it == profiles.end() || !it->second.hasMMA)
+        continue;
+      for (auto &Arg : F.args())
+        if (Arg.getType()->isPointerTy() &&
+            Arg.getType()->getPointerAddressSpace() == AS::Device)
+          PTM.set(&Arg, F32);
+      for (auto &BB : F)
+        for (auto &I : BB)
+          if (I.getType()->isPointerTy() &&
+              I.getType()->getPointerAddressSpace() == AS::Device)
+            PTM.set(&I, F32);
+    }
+  }
 
-  // Phase 4: Default unresolved device pointers to float*
+  // Phase 4: Default unresolved device pointers to float* in MMA functions.
   for (auto &F : M) {
+    auto it = profiles.find(&F);
+    if (it == profiles.end() || !it->second.hasMMA)
+      continue;
     for (auto &Arg : F.args()) {
       if (!Arg.getType()->isPointerTy() || PTM.has(&Arg))
         continue;
@@ -197,9 +220,12 @@ PreservedAnalyses InferTypedPointersPass::run(Module &M,
       }
     }
 
-    // ALL kernel device pointer args → float* (GPU JIT crashes on half*)
+    // MMA kernel device pointer args → float*
     for (auto &F : M) {
       if (F.isDeclaration()) continue;
+      auto it = profiles.find(&F);
+      if (it == profiles.end() || !it->second.hasMMA)
+        continue;
       for (auto &Arg : F.args())
         if (Arg.getType()->isPointerTy() &&
             Arg.getType()->getPointerAddressSpace() == AS::Device)

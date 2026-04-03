@@ -58,6 +58,9 @@ KernelProfileAnalysis::run(Module &M, ModuleAnalysisManager &AM) {
           if (auto *Callee = CI->getCalledFunction()) {
             StringRef name = Callee->getName();
 
+            if (name.starts_with("air.simdgroup_matrix_8x8_"))
+              facts.hasMMA = true;
+
             // Per-thread index
             if (name.starts_with(air::kCallTid) ||
                 name.starts_with(air::kCallTidTG) ||

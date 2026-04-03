@@ -2,9 +2,10 @@
 //
 // Two phases:
 //
-// Phase A (MMA-gated): When simdgroup_matrix_8x8 intrinsics are present,
-// ALL device loads must be float. Uses GEP decomposition for precise
-// half-scaled widening with lane extraction.
+  // Phase A (MMA-gated): In functions that use simdgroup_matrix_8x8
+  // intrinsics, non-float device traffic is rewritten through float loads
+  // and stores. Uses GEP decomposition for precise half-scaled widening
+  // with lane extraction.
 //
 // Phase B (unconditional): Non-float device loads/stores/GEPs connected
 // to phi nodes crash Metal GPU JIT regardless of MMA. The serializer
@@ -21,19 +22,29 @@
 using namespace llvm;
 namespace metalir {
 
-bool WidenDeviceLoadsPass::needsRun(Module &M) {
-  // Phase A: MMA present AND non-float device loads
-  bool hasMMA = false;
-  for (auto &F : M)
-    if (F.getName().starts_with("air.simdgroup_matrix_8x8_"))
-      { hasMMA = true; break; }
-
-  if (hasMMA) {
-    for (auto &F : M)
-      for (auto &BB : F)
-        for (auto &I : BB)
-          if (isDeviceLoad(&I) && !cast<LoadInst>(&I)->getType()->isFloatTy())
+static bool functionUsesMMA(const Function &F) {
+  for (const auto &BB : F)
+    for (const auto &I : BB)
+      if (const auto *CI = dyn_cast<CallInst>(&I))
+        if (const auto *Callee = CI->getCalledFunction())
+          if (Callee->getName().starts_with("air.simdgroup_matrix_8x8_"))
             return true;
+  return false;
+}
+
+bool WidenDeviceLoadsPass::needsRun(Module &M) {
+  // Phase A: a function uses MMA and still has non-float device memory traffic.
+  for (auto &F : M) {
+    if (F.isDeclaration() || !functionUsesMMA(F))
+      continue;
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        if (isDeviceLoad(&I) && !cast<LoadInst>(&I)->getType()->isFloatTy())
+          return true;
+        if (isDeviceStore(&I) &&
+            !cast<StoreInst>(&I)->getValueOperand()->getType()->isFloatTy())
+          return true;
+      }
   }
 
   // Phase B: ptr addrspace(1) phi with non-float uses
@@ -150,7 +161,7 @@ static bool widenPhiConnectedOps(Module &M, Type *F32) {
         auto *bc = CastInst::Create(Instruction::BitCast,
                                      LI->getPointerOperand(),
                                      LI->getPointerOperand()->getType(),
-                                     "", LI);
+                                     "", LI->getIterator());
         LI->setOperand(0, bc);
         changed = true;
       }
@@ -176,7 +187,7 @@ static bool widenPhiConnectedOps(Module &M, Type *F32) {
         if (!fromPhi) continue;
         auto *bc = CastInst::Create(Instruction::BitCast,
                                      storePtr, storePtr->getType(),
-                                     "", SI);
+                                     "", SI->getIterator());
         SI->setOperand(1, bc);
         changed = true;
       }
@@ -247,8 +258,7 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
     SmallVector<LoadInst *, 16> loadsToWiden;
     for (auto &F : M) {
       auto it = profiles.find(&F);
-      if (it != profiles.end() && !it->second.needsDeviceLoadWidening()
-          && !it->second.hasNonFloatDeviceStore)
+      if (it != profiles.end() && !it->second.needsDeviceLoadWidening())
         continue;
       for (auto &BB : F)
         for (auto &I : BB)
@@ -332,7 +342,7 @@ PreservedAnalyses WidenDeviceLoadsPass::run(Module &M,
     SmallVector<StoreInst *, 16> storesToWiden;
     for (auto &F : M) {
       auto it = profiles.find(&F);
-      if (it != profiles.end() && !it->second.hasNonFloatDeviceStore)
+      if (it != profiles.end() && !it->second.needsDeviceLoadWidening())
         continue;
       for (auto &BB : F)
         for (auto &I : BB)
