@@ -190,7 +190,7 @@ PreservedAnalyses NormalizeAllocasPass::run(Module &M,
               IRBuilder<> B(GEP);
               Type *F32 = Type::getFloatTy(M.getContext());
               Value *idx = GEP->getOperand(1);
-              Value *newIdx = B.CreateLShr(idx,
+              Value *newIdx = B.CreateAShr(idx,
                   ConstantInt::get(idx->getType(), 1), "idx_f");
               auto *newGEP = B.CreateInBoundsGEP(F32, GEP->getPointerOperand(),
                                                    newIdx, GEP->getName());

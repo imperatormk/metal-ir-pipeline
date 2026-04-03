@@ -6,7 +6,8 @@
 //
 // Strategy:
 // 1. Insert barrier before TG stores in straight-line blocks
-// 2. For conditional branches to TG-store blocks, insert barrier at join
+// 2. For conditional branches to TG-store blocks, insert a barrier before the
+//    branch so that all threads participate
 // 3. WAR hazard: barrier between TG load and branch to TG-store block
 //
 // Skip blocks that are conditional branch targets (barrier divergence
@@ -19,6 +20,7 @@
 #include "metal-ir/MetalConstraints.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 using namespace llvm;
 namespace metalir {
@@ -37,6 +39,31 @@ static CallInst *createBarrier(IRBuilder<> &B, Module &M) {
   FunctionType *FTy = FunctionType::get(Type::getVoidTy(Ctx), {I32, I32}, false);
   FunctionCallee FC = M.getOrInsertFunction(air::kBarrier, FTy);
   return B.CreateCall(FC, {ConstantInt::get(I32, 2), ConstantInt::get(I32, 1)});
+}
+
+static bool predecessorEndsWithBarrier(BasicBlock *BB) {
+  if (auto *pred = BB->getSinglePredecessor()) {
+    if (auto *term = pred->getTerminator())
+      if (Instruction *prev = term->getPrevNode())
+        if (isBarrierCall(prev))
+          return true;
+  }
+  return false;
+}
+
+static void ensureBarrierBeforeConditionalBranch(BranchInst *BI, Module &M,
+                                                 bool &changed) {
+  auto *parent = BI->getParent();
+  if (Instruction *prev = BI->getPrevNode())
+    if (isBarrierCall(prev))
+      return;
+  if (predecessorEndsWithBarrier(parent))
+    return;
+
+  parent->splitBasicBlock(BI, parent->getName() + ".tgbr");
+  IRBuilder<> B(parent->getTerminator());
+  createBarrier(B, M);
+  changed = true;
 }
 
 bool TGBarrierInsertPass::needsRun(Module &M) {
@@ -99,22 +126,16 @@ PreservedAnalyses TGBarrierInsertPass::run(Module &M,
       }
     }
 
-    // Strategy 2: for conditional branches to TG-store blocks,
-    // insert barrier at the join block (false-branch target)
+    // Strategy 2: ensure all threads pass through a barrier before any branch
+    // whose true successor writes to TG memory.
     for (auto &BB : F) {
       auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
       if (!BI || !BI->isConditional()) continue;
 
       BasicBlock *trueBB = BI->getSuccessor(0);
-      BasicBlock *falseBB = BI->getSuccessor(1);
 
       if (tgStoreBlocks.count(trueBB)) {
-        // Insert barrier at start of join block (falseBB)
-        if (falseBB->empty() || !isBarrierCall(&falseBB->front())) {
-          IRBuilder<> B(&*falseBB->getFirstInsertionPt());
-          createBarrier(B, M);
-          changed = true;
-        }
+        ensureBarrierBeforeConditionalBranch(BI, M, changed);
       }
     }
 
