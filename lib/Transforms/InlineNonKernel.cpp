@@ -29,6 +29,15 @@ PreservedAnalyses InlineNonKernelFunctionsPass::run(Module &M,
   bool changed = false;
   SmallPtrSet<Function *, 4> wasCallee;
 
+  // Metal has no call stack — ALL non-kernel functions must be inlined.
+  // Strip noinline attributes so InlineFunction succeeds even on functions
+  // marked noinline by the frontend (e.g. Triton's noinline=True).
+  for (auto &F : M) {
+    if (F.isDeclaration()) continue;
+    if (F.hasFnAttribute(Attribute::NoInline))
+      F.removeFnAttr(Attribute::NoInline);
+  }
+
   // Repeat until no more inlining (handles nested calls: A→B→C)
   for (unsigned round = 0; round < 20; round++) {
     SmallVector<CallInst *, 16> toInline;
